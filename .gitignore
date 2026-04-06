@@ -1,0 +1,44 @@
+# ── Images and data (stay local, never pushed to GitHub) ──
+data/raw/
+data/results/
+
+# Common image formats
+*.jpg
+*.JPG
+*.jpeg
+*.JPEG
+*.png
+*.PNG
+*.tif
+*.tiff
+
+# Pipeline outputs
+*.xlsx
+*.csv
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Conda / virtualenv ──
+envs/
+.env
+.venv
+env/
+
+# ── OS files ──
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Editors ──
+.vscode/
+.idea/
+*.swp
+*.swo
