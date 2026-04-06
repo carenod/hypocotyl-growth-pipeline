@@ -203,35 +203,44 @@ def trace_hypocotyl(img: np.ndarray,
 
 
 def trace_all(img: np.ndarray,
-              clicks: list,
-              boundary_row: int,
+              pairs: list,
               px_per_mm: float = None) -> list:
     """
-    Trace all hypocotyls from a list of click points.
+    Trace all hypocotyls from annotated pairs.
 
     Args:
-        img          : RGB image
-        clicks       : list of (row, col) cotyledon positions
-        boundary_row : bottom boundary row
-        px_per_mm    : calibration (stored into config for tracer)
+        img      : RGB image
+        pairs    : list of dicts {'top': (r,c), 'bot': (r,c), 'color': hex}
+                   top = cotyledon position, bot = root tip (boundary per seedling)
+        px_per_mm: calibration (stored into config for tracer)
 
-    Returns list of trace result dicts (one per click), in click order.
+    Returns list of trace result dicts (one per pair), in order.
     """
     if px_per_mm is not None:
         config.PX_PER_MM_HINT = px_per_mm
 
     print(f"\n[Tracer] Computing Frangi vesselness map...")
     vessel = compute_vesselness(img)
-    print(f"[Tracer] Tracing {len(clicks)} hypocotyls to boundary row={boundary_row}")
+    print(f"[Tracer] Tracing {len(pairs)} hypocotyls...")
 
     results = []
-    for i, (cr, cc) in enumerate(clicks):
-        result = trace_hypocotyl(img, vessel, cr, cc, boundary_row)
+    for i, pair in enumerate(pairs):
+        cr, cc    = pair['top']
+        bot_r, _  = pair['bot']   # use the row of the bottom click as boundary
+        result = trace_hypocotyl(img, vessel, cr, cc, bot_r)
         result['label'] = i + 1
         result['click'] = (cr, cc)
+        result['color'] = pair.get('color', PALETTE[i % len(PALETTE)])
         mm_str = f"{result['length_mm']:.2f}mm" if result['length_mm'] else "?mm"
-        print(f"  [{i+1}] click=({cr},{cc})  "
+        print(f"  [{i+1}] top=({cr},{cc}) bot_row={bot_r}  "
               f"length={result['length_px']:.0f}px  {mm_str}")
         results.append(result)
 
     return results
+
+
+# palette for fallback colour assignment
+PALETTE = [
+    '#FF6464', '#64FF64', '#6464FF', '#FFFF64',
+    '#FF64FF', '#64FFFF', '#FFA040', '#40FFA0',
+]

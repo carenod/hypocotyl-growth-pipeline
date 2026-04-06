@@ -24,21 +24,16 @@ def main():
     parser = argparse.ArgumentParser(
         description="Arabidopsis hypocotyl growth measurement pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python pipeline/run_pipeline.py data/raw/IMG_1721.JPG data/raw/IMG_1731.JPG
-  python pipeline/run_pipeline.py data/raw/t1.JPG data/raw/t2.JPG --out data/results/exp01
-  python pipeline/run_pipeline.py data/raw/t1.JPG data/raw/t2.JPG --no-align
-        """
     )
-    parser.add_argument("image_t1", help="Timepoint 1 image (e.g. data/raw/IMG_1721.JPG)")
-    parser.add_argument("image_t2", help="Timepoint 2 image (e.g. data/raw/IMG_1731.JPG)")
+    parser.add_argument("image_t1", help="Timepoint 1 image")
+    parser.add_argument("image_t2", help="Timepoint 2 image")
     parser.add_argument("--out",      default=None,
-                        help="Output directory (default: data/results/<t1>_vs_<t2>/)")
+                        help="Output directory "
+                             "(default: data/results/<t1>_vs_<t2>/)")
     parser.add_argument("--no-align", action="store_true",
                         help="Skip image alignment step")
     parser.add_argument("--debug",    action="store_true",
-                        help="Show extra debug plots during preprocessing")
+                        help="Show extra debug plots")
     args = parser.parse_args()
 
     t1_path = Path(args.image_t1)
@@ -73,92 +68,101 @@ Examples:
     print(f"\n  t1: {crop_t1.shape}  px/mm={ppm_t1}  divider x={div_x_t1}")
     print(f"  t2: {crop_t2.shape}  px/mm={ppm_t2}  divider x={div_x_t2}")
 
+    div_x = div_x_t1
+
     # ══════════════════════════════════════════
+    print("\n" + "="*55)
+    print("  STEP 2 – Alignment  (t2 → t1 coordinate space)")
+    print("="*55)
+    import numpy as np
+    import cv2
+    import matplotlib
+    import matplotlib.pyplot as plt
+
     if not args.no_align:
-        print("\n" + "="*55)
-        print("  STEP 2 – Alignment  (t2 → t1 coordinate space)")
-        print("="*55)
         from step2_alignment import align_images
         crop_t2_aligned, H = align_images(crop_t1, crop_t2, debug=args.debug)
-        div_x = div_x_t1
-        print(f"  Alignment done. Using t1 divider x={div_x}.")
+        print(f"  Alignment done.")
     else:
         crop_t2_aligned = crop_t2
         H = None
         div_x = (div_x_t1 + div_x_t2) // 2
-        print(f"\n  Alignment skipped. Average divider x={div_x}.")
+        print(f"  Alignment skipped.")
+
+    # ── FIX 3: Save aligned t2 image for inspection ──
+    aligned_path = str(qc_dir / f"aligned_t2_{t2_name}.png")
+    plt.figure(figsize=(12, 9))
+    plt.imshow(crop_t2_aligned)
+    plt.title(f"Aligned t2: {t2_name}\n(check this matches t1 layout)",
+              fontsize=11)
+    plt.axis('off')
+    plt.tight_layout()
+    plt.savefig(aligned_path, dpi=120)
+    plt.close()
+    print(f"  Aligned t2 saved → {aligned_path}")
+    print(f"  ↑ Open this file to check alignment quality before proceeding")
 
     # ══════════════════════════════════════════
     print("\n" + "="*55)
-    print("  STEP 3 – Click annotation + tracing")
+    print("  STEP 3a – Annotate t1 (click cotyledon + root tip per seedling)")
     print("="*55)
-    from step3_click_interface import run_click_session, show_qc_window
+    from step3_click_interface import (run_t1_session, run_t2_session,
+                                       show_qc_window)
     from step3_tracer import trace_all
-    import numpy as np
-    import cv2
 
-    # Store px/mm in config so tracer can use it for Frangi scales
     config.PX_PER_MM_HINT = ppm_t1 or 33.0
 
-    print("\n  → Opening annotation window for t1...")
-    print("  Instructions:")
-    print("    1. Click LEFT then RIGHT edge of bottom boundary line")
-    print("       (this separates hypocotyl from root)")
-    print("    2. Click each cotyledon — a numbered dot appears")
-    print("    3. Right-click a dot to undo the last click")
-    print("    4. Press ENTER to confirm and run tracing")
-
-    # Show the full plate crop for clicking (not split by side)
-    clicks_img_coords, boundary_row = run_click_session(
+    # ── T1 annotation ──
+    pairs_t1 = run_t1_session(
         crop_t1,
-        title=f"t1: {t1_path.name} — Annotate cotyledons"
+        title=f"t1: {t1_path.name}  —  Click COTYLEDON then ROOT TIP per seedling"
     )
 
-    if not clicks_img_coords:
-        print("  No clicks recorded — exiting.")
-        sys.exit(0)
-
-    print(f"\n  {len(clicks_img_coords)} cotyledons annotated, "
-          f"boundary at row {boundary_row}")
-
-    # Determine which side each click belongs to
-    for i, (r, c) in enumerate(clicks_img_coords):
-        side = "Left (A)" if c < div_x else "Right (B)"
-        print(f"    [{i+1}] row={r} col={c} → {side}")
+    # Log which side each seedling is on
+    for i, p in enumerate(pairs_t1):
+        r, c  = p['top']
+        side  = "Left (A)" if c < div_x else "Right (B)"
+        print(f"  [{i+1}] top=({r},{c}) bot={p['bot']} → {side}")
 
     # ── Trace t1 ──
     print("\n  → Tracing hypocotyls in t1...")
-    results_t1 = trace_all(
-        crop_t1,
-        clicks_img_coords,
-        boundary_row,
-        px_per_mm=ppm_t1,
-    )
+    results_t1 = trace_all(crop_t1, pairs_t1, px_per_mm=ppm_t1)
 
-    # ── Map clicks to t2 via homography ──
-    print("\n  → Mapping click points to t2...")
+    # ══════════════════════════════════════════
+    print("\n" + "="*55)
+    print("  STEP 3b – Verify t2 positions")
+    print("="*55)
+
+    # Map t1 pairs to t2 via homography
     if H is not None:
-        # H maps t2→t1, so we need H_inv to map t1→t2
         H_inv = np.linalg.inv(H)
-        clicks_t2 = []
-        for r, c in clicks_img_coords:
-            pt = np.array([[[float(c), float(r)]]], dtype=np.float32)
-            mapped = cv2.perspectiveTransform(pt, H_inv)
-            new_c, new_r = mapped[0][0]
-            clicks_t2.append((int(new_r), int(new_c)))
+        suggested = []
+        for p in pairs_t1:
+            def map_pt(r, c):
+                pt      = np.array([[[float(c), float(r)]]], dtype=np.float32)
+                mapped  = cv2.perspectiveTransform(pt, H_inv)
+                nc, nr  = mapped[0][0]
+                return (int(nr), int(nc))
+            suggested.append({
+                'top'  : map_pt(*p['top']),
+                'bot'  : map_pt(*p['bot']),
+                'color': p['color'],
+            })
     else:
         # No alignment — use same coordinates
-        clicks_t2 = clicks_img_coords
+        suggested = [{'top': p['top'], 'bot': p['bot'],
+                      'color': p['color']} for p in pairs_t1]
+
+    pairs_t2 = run_t2_session(
+        crop_t2_aligned,
+        title=f"t2: {t2_path.name}  —  Verify / correct suggested positions",
+        suggested_pairs=suggested,
+    )
 
     # ── Trace t2 ──
     print("\n  → Tracing hypocotyls in t2...")
     config.PX_PER_MM_HINT = ppm_t2 or 33.0
-    results_t2 = trace_all(
-        crop_t2_aligned,
-        clicks_t2,
-        boundary_row,
-        px_per_mm=ppm_t2,
-    )
+    results_t2 = trace_all(crop_t2_aligned, pairs_t2, px_per_mm=ppm_t2)
 
     # ══════════════════════════════════════════
     print("\n" + "="*55)
@@ -167,14 +171,13 @@ Examples:
 
     qc_path = str(qc_dir / f"qc_{t1_name}_vs_{t2_name}.png")
     show_qc_window(
-        img_t1        = crop_t1,
+        img_t1         = crop_t1,
         img_t2_aligned = crop_t2_aligned,
-        results_t1    = results_t1,
-        results_t2    = results_t2,
-        boundary_row  = boundary_row,
-        px_per_mm_t1  = ppm_t1 or 1.0,
-        px_per_mm_t2  = ppm_t2 or 1.0,
-        out_path      = qc_path,
+        results_t1     = results_t1,
+        results_t2     = results_t2,
+        px_per_mm_t1   = ppm_t1 or 1.0,
+        px_per_mm_t2   = ppm_t2 or 1.0,
+        out_path       = qc_path,
     )
 
     # ══════════════════════════════════════════
@@ -191,29 +194,26 @@ Examples:
         side  = "Left (A)" if col < div_x else "Right (B)"
 
         l_t1_px = r1['length_px']
-        l_t2_px = r2['length_px'] if r2 else None
+        l_t2_px = r2['length_px']  if r2 else None
         l_t1_mm = r1['length_mm']
-        l_t2_mm = r2['length_mm'] if r2 else None
-
-        delta_mm    = (l_t2_mm - l_t1_mm) if (l_t1_mm and l_t2_mm) else None
-        growth_pct  = (delta_mm / l_t1_mm * 100) if (delta_mm and l_t1_mm) else None
-        matched     = r2 is not None
+        l_t2_mm = r2['length_mm']  if r2 else None
+        delta   = (l_t2_mm - l_t1_mm) if (l_t1_mm and l_t2_mm) else None
+        growth  = (delta / l_t1_mm * 100) if (delta and l_t1_mm) else None
 
         rows.append({
             'genotype_side'   : side,
             'label'           : label,
             'length_t1_px'    : round(l_t1_px, 1),
-            'length_t2_px'    : round(l_t2_px, 1) if l_t2_px else None,
-            'length_t1_mm'    : round(l_t1_mm, 3) if l_t1_mm else None,
-            'length_t2_mm'    : round(l_t2_mm, 3) if l_t2_mm else None,
-            'delta_mm'        : round(delta_mm, 3) if delta_mm else None,
-            'growth_rate_pct' : round(growth_pct, 1) if growth_pct else None,
-            'matched'         : matched,
+            'length_t2_px'    : round(l_t2_px, 1)   if l_t2_px else None,
+            'length_t1_mm'    : round(l_t1_mm, 3)   if l_t1_mm else None,
+            'length_t2_mm'    : round(l_t2_mm, 3)   if l_t2_mm else None,
+            'delta_mm'        : round(delta, 3)      if delta    else None,
+            'growth_rate_pct' : round(growth, 1)     if growth   else None,
+            'matched'         : r2 is not None,
             'notes'           : '',
         })
 
     df = pd.DataFrame(rows)
-
     print(f"\n  Measurements ({len(df)} hypocotyls):")
     print(df[['genotype_side', 'label', 'length_t1_mm',
               'length_t2_mm', 'delta_mm', 'growth_rate_pct']].to_string(index=False))
@@ -221,17 +221,18 @@ Examples:
     xlsx_path = out_dir / f"measurements_{t1_name}_vs_{t2_name}.xlsx"
     export_excel(
         df, str(xlsx_path),
-        px_per_mm_t1=ppm_t1 or 1.0,
-        px_per_mm_t2=ppm_t2 or 1.0,
-        image_t1=str(t1_path),
-        image_t2=str(t2_path),
+        px_per_mm_t1 = ppm_t1 or 1.0,
+        px_per_mm_t2 = ppm_t2 or 1.0,
+        image_t1     = str(t1_path),
+        image_t2     = str(t2_path),
     )
 
     print("\n" + "="*55)
     print("  DONE")
     print("="*55)
-    print(f"  QC image → {qc_path}")
-    print(f"  Excel    → {xlsx_path}")
+    print(f"  Aligned t2  → {aligned_path}")
+    print(f"  QC image    → {qc_path}")
+    print(f"  Excel       → {xlsx_path}")
     print()
 
 

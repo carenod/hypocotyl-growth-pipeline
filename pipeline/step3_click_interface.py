@@ -1,13 +1,15 @@
 # ─────────────────────────────────────────────
 #  step3_click_interface.py
-#  Interactive matplotlib window for hypocotyl annotation.
+#
+#  Two-phase annotation:
+#    Phase A (t1): click cotyledon TOP then root TIP per seedling
+#    Phase B (t2): verify/correct suggested positions (pre-populated
+#                  from homography-mapped t1 clicks)
 # ─────────────────────────────────────────────
 
 import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-from matplotlib.patches import FancyArrowPatch
 import cv2
 import sys
 
@@ -26,125 +28,45 @@ PALETTE = [
 
 
 # ─────────────────────────────────────────────
-#  Instruction panel (drawn on the right side)
+#  T1 annotation window
+#  Click alternating: cotyledon top, root tip, cotyledon top, root tip...
 # ─────────────────────────────────────────────
 
-INSTRUCTIONS = [
-    ("STEP 1  —  Set the bottom boundary", "#1a73e8", True),
-    ("", "#1a73e8", False),
-    ("The boundary line separates the hypocotyl", "white", False),
-    ("(upper part) from the root (lower part).", "white", False),
-    ("", "white", False),
-    ("→ Click anywhere on the LEFT side of", "#64FFFF", False),
-    ("   the image at the height where roots", "#64FFFF", False),
-    ("   begin (roughly where hypocotyls end).", "#64FFFF", False),
-    ("→ Then click the same height on the", "#64FFFF", False),
-    ("   RIGHT side of the image.", "#64FFFF", False),
-    ("→ A cyan dashed line will appear.", "#64FFFF", False),
-    ("", "white", False),
-    ("─" * 38, "#555555", False),
-    ("", "white", False),
-    ("STEP 2  —  Click each cotyledon", "#e8891a", True),
-    ("", "#e8891a", False),
-    ("Cotyledons are the small green/yellow", "white", False),
-    ("leaves at the top of each seedling.", "white", False),
-    ("", "white", False),
-    ("→ Click once on each cotyledon.", "#FFFF64", False),
-    ("   A numbered dot appears.", "#FFFF64", False),
-    ("→ Click ALL plants (left + right side).", "#FFFF64", False),
-    ("→ Right-click a dot to remove it.", "#FFFF64", False),
-    ("", "white", False),
-    ("─" * 38, "#555555", False),
-    ("", "white", False),
-    ("STEP 3  —  Confirm", "#1ae85a", True),
-    ("", "#1ae85a", False),
-    ("→ Press ENTER when done.", "#64FF64", False),
-    ("   The pipeline traces each hypocotyl", "#64FF64", False),
-    ("   downward to the boundary line.", "#64FF64", False),
-]
+class T1Collector:
+    """
+    Alternating clicks:
+      odd  click (1, 3, 5...) = cotyledon top  (green dot)
+      even click (2, 4, 6...) = root tip / hypocotyl bottom  (red dot)
+    Each pair = one seedling.
+    """
 
-
-def _draw_instruction_panel(fig):
-    """Draw a fixed instruction panel on the right side of the figure."""
-    ax_inst = fig.add_axes([0.72, 0.05, 0.27, 0.90])
-    ax_inst.set_facecolor('#1a1a2e')
-    ax_inst.set_xlim(0, 1)
-    ax_inst.set_ylim(0, 1)
-    ax_inst.axis('off')
-
-    n = len(INSTRUCTIONS)
-    y_start = 0.97
-    line_h  = y_start / (n + 1)
-
-    for i, (text, color, bold) in enumerate(INSTRUCTIONS):
-        y = y_start - i * line_h
-        ax_inst.text(
-            0.04, y, text,
-            color=color,
-            fontsize=8.5,
-            fontweight='bold' if bold else 'normal',
-            fontfamily='monospace',
-            va='top',
-            transform=ax_inst.transAxes,
-            clip_on=True,
-        )
-
-    # Border
-    for spine in ax_inst.spines.values():
-        spine.set_edgecolor('#444466')
-        spine.set_linewidth(1.5)
-
-    return ax_inst
-
-
-# ─────────────────────────────────────────────
-#  Status bar
-# ─────────────────────────────────────────────
-
-STATUS_MSGS = {
-    (0, 0): ("STEP 1 of 3:  Click the LEFT side of the image at the height "
-             "where hypocotyls end and roots begin",
-             "#1a73e8"),
-    (0, 1): ("STEP 1 of 3:  Good! Now click the RIGHT side at the same height",
-             "#1a73e8"),
-    (1, 0): ("STEP 2 of 3:  Click each cotyledon (green/yellow leaf at top "
-             "of each seedling) — left AND right side",
-             "#e8891a"),
-    'n'   : ("STEP 2 of 3:  {n} cotyledon(s) marked  |  "
-             "Right-click to undo  |  Press ENTER when all are marked",
-             "#e8891a"),
-    'done': ("✓ Confirmed — running pipeline...", "#1ae85a"),
-}
-
-
-# ─────────────────────────────────────────────
-#  Click collector
-# ─────────────────────────────────────────────
-
-class ClickCollector:
     def __init__(self, ax, img_shape):
-        self.ax           = ax
-        self.h, self.w    = img_shape[:2]
-        self.phase        = 0
-        self.boundary_pts = []
-        self.boundary_row = None
-        self.clicks       = []
-        self.dot_artists  = []
-        self._bline       = None
-        self._confirmed   = False
+        self.ax        = ax
+        self.h, self.w = img_shape[:2]
+        self.pairs     = []          # list of {'top': (r,c), 'bot': (r,c)}
+        self._pending_top = None     # top click waiting for its bottom
+        self._artists  = []          # for undo
+        self._confirmed = False
+        self._n_clicks  = 0
 
-        # Status bar at bottom of image axes
         self._status = ax.text(
             0.01, 0.015,
-            STATUS_MSGS[(0, 0)][0],
+            self._step_msg(),
             transform=ax.transAxes,
             color='white', fontsize=10, fontweight='bold',
             bbox=dict(boxstyle='round,pad=0.4',
-                      facecolor=STATUS_MSGS[(0, 0)][1], alpha=0.92),
+                      facecolor='#1a6e1a', alpha=0.92),
             va='bottom', zorder=10,
         )
 
-    # ── event handlers ──────────────────────
+    def _step_msg(self):
+        n = len(self.pairs)
+        if self._pending_top is None:
+            return (f"Click {n+1}: COTYLEDON TOP  (green leaf above hypocotyl) "
+                    f"— {n} seedling(s) done so far")
+        else:
+            return (f"Click {n+1}: ROOT TIP  (bottom of hypocotyl, where root begins) "
+                    f"— then next cotyledon top")
 
     def on_click(self, event):
         if event.inaxes != self.ax or self._confirmed:
@@ -153,186 +75,354 @@ class ClickCollector:
         if x is None or y is None:
             return
 
-        if event.button == 3:          # right-click → undo last cotyledon
+        if event.button == 3:
             self._undo()
             return
 
-        if event.button == 1:          # left-click
-            if self.phase == 0:
-                self._add_boundary_point(x, y)
-            else:
-                self._add_cotyledon(x, y)
+        r, c = int(y), int(x)
+        self._n_clicks += 1
 
+        if self._pending_top is None:
+            # This is a cotyledon top click
+            self._pending_top = (r, c)
+            n = len(self.pairs) + 1
+            color = PALETTE[(n - 1) % len(PALETTE)]
+            dot = self.ax.plot(c, r, 'o', color=color,
+                               markersize=13, markeredgecolor='white',
+                               markeredgewidth=2.5, zorder=9)[0]
+            lbl = self.ax.text(c + 12, r - 6, f"{n}▲",
+                               color='white', fontsize=10, fontweight='bold',
+                               bbox=dict(boxstyle='round,pad=0.2',
+                                         facecolor=color, alpha=0.88),
+                               zorder=10)
+            self._artists.append({'kind': 'top', 'color': color,
+                                   'artists': [dot, lbl], 'top': (r, c)})
+        else:
+            # This is the root tip click for the pending top
+            top = self._pending_top
+            n   = len(self.pairs) + 1
+            color = PALETTE[(n - 1) % len(PALETTE)]
+
+            # Draw line from top to bottom + bottom dot
+            line = self.ax.plot([top[1], c], [top[0], r],
+                                '--', color=color, linewidth=1.5,
+                                alpha=0.7, zorder=8)[0]
+            dot  = self.ax.plot(c, r, 's', color=color,
+                                markersize=11, markeredgecolor='white',
+                                markeredgewidth=2, zorder=9)[0]
+            lbl  = self.ax.text(c + 12, r + 4, f"{n}▼",
+                                color='white', fontsize=10, fontweight='bold',
+                                bbox=dict(boxstyle='round,pad=0.2',
+                                          facecolor=color, alpha=0.88),
+                                zorder=10)
+            self._artists.append({'kind': 'bot', 'color': color,
+                                   'artists': [dot, lbl, line]})
+            self.pairs.append({'top': top, 'bot': (r, c), 'color': color})
+            self._pending_top = None
+
+        self._update_status()
         self.ax.figure.canvas.draw_idle()
+
+    def _undo(self):
+        if not self._artists:
+            return
+        entry = self._artists.pop()
+        for a in entry['artists']:
+            a.remove()
+        if entry['kind'] == 'bot':
+            self.pairs.pop()
+        self._pending_top = None
+        self._update_status()
+        self.ax.figure.canvas.draw_idle()
+
+    def _update_status(self):
+        self._status.set_text(self._step_msg())
+        color = '#1a6e1a' if self._pending_top is None else '#8b4500'
+        self._status.get_bbox_patch().set_facecolor(color)
 
     def on_key(self, event):
         if event.key == 'enter':
-            if self.phase == 0:
-                self._print_hint("Draw the boundary line first (2 clicks needed)")
+            if self._pending_top is not None:
+                print("  [click] Complete the current seedling "
+                      "(click the root tip) before confirming")
                 return
-            if len(self.clicks) == 0:
-                self._print_hint("Click at least one cotyledon first")
+            if not self.pairs:
+                print("  [click] Click at least one seedling first")
                 return
             self._confirmed = True
-            self._set_status('done')
+            self._status.set_text(
+                f"✓ {len(self.pairs)} seedlings confirmed — running...")
+            self._status.get_bbox_patch().set_facecolor('#1a1ae8')
             self.ax.figure.canvas.draw_idle()
             plt.close(self.ax.figure)
 
-    # ── boundary line ────────────────────────
 
-    def _add_boundary_point(self, x, y):
-        self.boundary_pts.append((x, y))
-        n = len(self.boundary_pts)
+# ─────────────────────────────────────────────
+#  T2 verification window
+#  Shows suggested positions from t1 mapping.
+#  User can move dots or accept as-is.
+# ─────────────────────────────────────────────
 
-        # Draw a small cross at the click
-        cross = self.ax.plot(x, y, 'c+', markersize=16,
-                             markeredgewidth=3, zorder=9)[0]
-        self.dot_artists.append({'type': 'boundary', 'artists': [cross]})
+class T2Collector:
+    """
+    Pre-populated with suggested (top, bot) pairs from t1 homography mapping.
+    User can:
+      - Accept all and press Enter
+      - Left-click near a dot to drag it (click = move to new position)
+      - Right-click a pair number to delete the whole pair
+    """
 
-        if n == 2:
-            # Average the two y values → horizontal boundary row
-            self.boundary_row = int((self.boundary_pts[0][1] +
-                                     self.boundary_pts[1][1]) / 2)
-            if self._bline:
-                self._bline.remove()
-            self._bline = self.ax.axhline(
-                self.boundary_row,
-                color='cyan', linewidth=2.5, linestyle='--',
-                label='Boundary (hypo/root split)', zorder=8
-            )
-            # Add label on the line
-            self.ax.text(
-                10, self.boundary_row - 8,
-                '← hypocotyl above  |  root below →',
-                color='cyan', fontsize=9, fontweight='bold',
-                bbox=dict(boxstyle='round,pad=0.2',
-                          facecolor='#000033', alpha=0.7),
-                zorder=9,
-            )
-            self.phase = 1
-            self._set_status((1, 0))
-        else:
-            self._set_status((0, n))
+    def __init__(self, ax, img_shape, suggested_pairs):
+        self.ax          = ax
+        self.h, self.w   = img_shape[:2]
+        self.pairs       = [{'top': p['top'], 'bot': p['bot'],
+                              'color': p['color']}
+                            for p in suggested_pairs]
+        self._artists    = []
+        self._confirmed  = False
+        self._selected   = None   # (pair_idx, 'top'|'bot') being moved
 
-    # ── cotyledon clicks ─────────────────────
-
-    def _add_cotyledon(self, x, y):
-        row, col  = int(y), int(x)
-        n         = len(self.clicks) + 1
-        color     = PALETTE[(n - 1) % len(PALETTE)]
-
-        dot = self.ax.plot(col, row, 'o',
-                           color=color, markersize=13,
-                           markeredgecolor='white',
-                           markeredgewidth=2.5, zorder=9)[0]
-        lbl = self.ax.text(
-            col + 14, row - 6, str(n),
-            color='white', fontsize=11, fontweight='bold',
-            bbox=dict(boxstyle='round,pad=0.25',
-                      facecolor=color, alpha=0.9),
-            zorder=10,
+        self._status = ax.text(
+            0.01, 0.015,
+            "CHECK suggested positions. Left-click to move a point. "
+            "Right-click a number to delete pair. Press ENTER to accept.",
+            transform=ax.transAxes,
+            color='white', fontsize=10, fontweight='bold',
+            bbox=dict(boxstyle='round,pad=0.4',
+                      facecolor='#1a1a8b', alpha=0.92),
+            va='bottom', zorder=10,
         )
-        # Small downward arrow to hint "trace goes down from here"
-        arr = self.ax.annotate(
-            '', xy=(col, row + 30), xytext=(col, row + 8),
-            arrowprops=dict(arrowstyle='->', color=color,
-                            lw=2.0), zorder=9,
-        )
-        self.clicks.append((row, col))
-        self.dot_artists.append({'type': 'cotyledon',
-                                  'artists': [dot, lbl, arr]})
-        self._set_status('n')
+        self._draw_all()
 
-    # ── undo ────────────────────────────────
+    def _draw_all(self):
+        for a in self._artists:
+            try:
+                a.remove()
+            except Exception:
+                pass
+        self._artists = []
 
-    def _undo(self):
-        # Only undo cotyledon clicks, not boundary points
-        cot_entries = [d for d in self.dot_artists if d['type'] == 'cotyledon']
-        if not cot_entries:
-            self._print_hint("Nothing to undo")
-            return
-        entry = cot_entries[-1]
-        for a in entry['artists']:
-            a.remove()
-        self.dot_artists.remove(entry)
-        self.clicks.pop()
-        self._set_status('n')
+        for i, p in enumerate(self.pairs):
+            color = p['color']
+            n     = i + 1
+            tr, tc = p['top']
+            br, bc = p['bot']
+
+            line = self.ax.plot([tc, bc], [tr, br], '--',
+                                color=color, linewidth=1.5,
+                                alpha=0.6, zorder=8)[0]
+            top_dot = self.ax.plot(tc, tr, 'o', color=color,
+                                   markersize=13, markeredgecolor='white',
+                                   markeredgewidth=2.5, zorder=9)[0]
+            bot_dot = self.ax.plot(bc, br, 's', color=color,
+                                   markersize=11, markeredgecolor='white',
+                                   markeredgewidth=2, zorder=9)[0]
+            lbl_t = self.ax.text(tc + 12, tr - 6, f"{n}▲",
+                                  color='white', fontsize=10, fontweight='bold',
+                                  bbox=dict(boxstyle='round,pad=0.2',
+                                            facecolor=color, alpha=0.88),
+                                  zorder=10)
+            lbl_b = self.ax.text(bc + 12, br + 4, f"{n}▼",
+                                  color='white', fontsize=10, fontweight='bold',
+                                  bbox=dict(boxstyle='round,pad=0.2',
+                                            facecolor=color, alpha=0.88),
+                                  zorder=10)
+            self._artists += [line, top_dot, bot_dot, lbl_t, lbl_b]
+
         self.ax.figure.canvas.draw_idle()
 
-    # ── helpers ──────────────────────────────
+    def _nearest_point(self, r, c, threshold=40):
+        """Find the nearest (pair_idx, 'top'|'bot') within threshold px."""
+        best_dist = threshold
+        best      = None
+        for i, p in enumerate(self.pairs):
+            for key in ('top', 'bot'):
+                pr, pc = p[key]
+                d = np.sqrt((r - pr)**2 + (c - pc)**2)
+                if d < best_dist:
+                    best_dist = d
+                    best      = (i, key)
+        return best
 
-    def _set_status(self, key):
-        if key == 'n':
-            msg, color = STATUS_MSGS['n']
-            msg = msg.format(n=len(self.clicks))
-        elif key == 'done':
-            msg, color = STATUS_MSGS['done']
-        else:
-            msg, color = STATUS_MSGS[key]
-        self._status.set_text(msg)
-        self._status.get_bbox_patch().set_facecolor(color)
+    def on_click(self, event):
+        if event.inaxes != self.ax or self._confirmed:
+            return
+        x, y = event.xdata, event.ydata
+        if x is None or y is None:
+            return
+        r, c = int(y), int(x)
 
-    def _print_hint(self, text):
-        print(f"  [click] Hint: {text}")
+        if event.button == 3:
+            # Right-click: delete nearest pair
+            hit = self._nearest_point(r, c, threshold=60)
+            if hit:
+                self.pairs.pop(hit[0])
+                self._draw_all()
+            return
+
+        if event.button == 1:
+            # Left-click: move nearest point
+            if self._selected is None:
+                hit = self._nearest_point(r, c)
+                if hit:
+                    self._selected = hit
+                    self._status.set_text(
+                        f"Moving point {hit[0]+1} {hit[1]} — "
+                        f"click new position")
+                    self.ax.figure.canvas.draw_idle()
+            else:
+                idx, key = self._selected
+                self.pairs[idx][key] = (r, c)
+                self._selected = None
+                self._status.set_text(
+                    "CHECK suggested positions. Left-click to move a point. "
+                    "Right-click to delete. Press ENTER to accept.")
+                self._draw_all()
+
+    def on_key(self, event):
+        if event.key == 'enter':
+            if not self.pairs:
+                print("  [click] No pairs — exiting")
+                return
+            self._confirmed = True
+            self._status.set_text(
+                f"✓ {len(self.pairs)} pairs accepted — saving...")
+            self._status.get_bbox_patch().set_facecolor('#1ae81a')
+            self.ax.figure.canvas.draw_idle()
+            plt.close(self.ax.figure)
 
 
 # ─────────────────────────────────────────────
-#  Main click session
+#  Public session functions
 # ─────────────────────────────────────────────
 
-def run_click_session(img_crop: np.ndarray,
-                      title: str = "Hypocotyl Annotator") -> tuple:
+def _instruction_panel(fig, lines):
+    ax_i = fig.add_axes([0.72, 0.05, 0.27, 0.90])
+    ax_i.set_facecolor('#111122')
+    ax_i.set_xlim(0, 1); ax_i.set_ylim(0, 1); ax_i.axis('off')
+    n = len(lines)
+    for j, (txt, col, bold) in enumerate(lines):
+        y = 0.97 - j * (0.97 / (n + 1))
+        ax_i.text(0.04, y, txt, color=col,
+                  fontsize=8.5, fontweight='bold' if bold else 'normal',
+                  fontfamily='monospace', va='top',
+                  transform=ax_i.transAxes, clip_on=True)
+
+
+def run_t1_session(img_crop: np.ndarray, title: str) -> list:
     """
-    Open interactive window. Returns (clicks, boundary_row).
-    clicks       : list of (row, col) in img_crop coordinates
-    boundary_row : int
+    Returns list of dicts: [{'top': (r,c), 'bot': (r,c), 'color': hex}, ...]
+    top = cotyledon position, bot = root tip / hypocotyl bottom
     """
-    # Leave room on the right for the instruction panel
     fig = plt.figure(figsize=(18, 10), facecolor='#0d0d1a')
     ax  = fig.add_axes([0.01, 0.05, 0.70, 0.90])
     ax.set_facecolor('#0d0d1a')
     ax.imshow(img_crop)
-    ax.set_title(title, color='white', fontsize=12,
-                 fontweight='bold', pad=8)
+    ax.set_title(title, color='white', fontsize=12, fontweight='bold', pad=8)
     ax.axis('off')
 
-    _draw_instruction_panel(fig)
+    _instruction_panel(fig, [
+        ("T1 ANNOTATION", "#FFD700", True),
+        ("", "white", False),
+        ("Click PAIRS per seedling:", "#64FFFF", True),
+        ("", "white", False),
+        ("  1st click = COTYLEDON TOP", "#64FF64", False),
+        ("     (green leaf at top of plant)", "white", False),
+        ("     → green circle ▲ appears", "#64FF64", False),
+        ("", "white", False),
+        ("  2nd click = ROOT TIP", "#FF9040", False),
+        ("     (where hypocotyl ends,", "white", False),
+        ("      root begins)", "white", False),
+        ("     → square ▼ + dashed line", "#FF9040", False),
+        ("", "white", False),
+        ("Repeat for every seedling.", "white", False),
+        ("Both left AND right side.", "white", False),
+        ("", "white", False),
+        ("─" * 35, "#444444", False),
+        ("", "white", False),
+        ("  Right-click = undo last", "#FFAAAA", False),
+        ("  ENTER = confirm all", "#AAFFAA", False),
+    ])
 
-    collector = ClickCollector(ax, img_crop.shape)
+    collector = T1Collector(ax, img_crop.shape)
     fig.canvas.mpl_connect('button_press_event', collector.on_click)
     fig.canvas.mpl_connect('key_press_event',    collector.on_key)
 
-    # Print concise terminal instructions too
     print("\n" + "─"*60)
-    print("  ANNOTATION WINDOW OPEN")
+    print("  T1 ANNOTATION WINDOW")
     print("─"*60)
-    print("  STEP 1: Set bottom boundary line")
-    print("    • Click on the LEFT side of the image at the height")
-    print("      where the hypocotyl ends and the root begins")
-    print("      (roughly where the plants stop being thick and")
-    print("       become thin transparent roots)")
-    print("    • Then click the SAME HEIGHT on the RIGHT side")
-    print("    • A cyan dashed line will appear across the image")
-    print()
-    print("  STEP 2: Click each cotyledon")
-    print("    • Cotyledons = the small green/yellow leaves at the")
-    print("      TOP of each seedling, just above the hypocotyl")
-    print("    • Click once per plant — left AND right side of plate")
-    print("    • A numbered coloured dot appears on each click")
-    print("    • Right-click to undo the last dot")
-    print()
-    print("  STEP 3: Press ENTER to confirm and run tracing")
+    print("  For each seedling, click TWO points:")
+    print("  1st click → COTYLEDON TOP (green leaf above hypocotyl)")
+    print("  2nd click → ROOT TIP (where hypocotyl ends, root begins)")
+    print("  Repeat for all seedlings (left + right side)")
+    print("  Right-click = undo last | ENTER = confirm")
     print("─"*60)
 
     plt.show(block=True)
 
-    if not collector._confirmed:
-        print("  [click] Window closed without confirming — exiting.")
-        sys.exit(0)
+    if not collector._confirmed or not collector.pairs:
+        print("  No annotations — exiting.")
+        import sys; sys.exit(0)
 
-    print(f"\n  [click] Confirmed: {len(collector.clicks)} cotyledons, "
-          f"boundary at row {collector.boundary_row}")
-    return collector.clicks, collector.boundary_row
+    print(f"  [click] {len(collector.pairs)} seedlings annotated")
+    return collector.pairs
+
+
+def run_t2_session(img_t2: np.ndarray, title: str,
+                   suggested_pairs: list) -> list:
+    """
+    Show t2 with suggested pairs pre-populated.
+    User verifies/corrects. Returns confirmed pairs.
+    """
+    fig = plt.figure(figsize=(18, 10), facecolor='#0d0d1a')
+    ax  = fig.add_axes([0.01, 0.05, 0.70, 0.90])
+    ax.set_facecolor('#0d0d1a')
+    ax.imshow(img_t2)
+    ax.set_title(title, color='white', fontsize=12, fontweight='bold', pad=8)
+    ax.axis('off')
+
+    _instruction_panel(fig, [
+        ("T2 VERIFICATION", "#FFD700", True),
+        ("", "white", False),
+        ("Suggested positions shown.", "white", False),
+        ("Check each seedling:", "#64FFFF", True),
+        ("", "white", False),
+        ("  ▲ circle = cotyledon top", "#64FF64", False),
+        ("  ▼ square = root tip", "#FF9040", False),
+        ("", "white", False),
+        ("To MOVE a point:", "#FFFF64", True),
+        ("  Left-click the dot,", "white", False),
+        ("  then left-click new position", "white", False),
+        ("", "white", False),
+        ("To DELETE a seedling:", "#FFAAAA", True),
+        ("  Right-click near its number", "white", False),
+        ("", "white", False),
+        ("─" * 35, "#444444", False),
+        ("", "white", False),
+        ("  ENTER = accept all", "#AAFFAA", False),
+    ])
+
+    collector = T2Collector(ax, img_t2.shape, suggested_pairs)
+    fig.canvas.mpl_connect('button_press_event', collector.on_click)
+    fig.canvas.mpl_connect('key_press_event',    collector.on_key)
+
+    print("\n" + "─"*60)
+    print("  T2 VERIFICATION WINDOW")
+    print("─"*60)
+    print("  Suggested positions pre-filled from t1 + alignment.")
+    print("  Left-click a dot → left-click new position to move it.")
+    print("  Right-click near a number to delete that seedling.")
+    print("  ENTER = accept all")
+    print("─"*60)
+
+    plt.show(block=True)
+
+    if not collector._confirmed or not collector.pairs:
+        print("  No pairs confirmed — exiting.")
+        import sys; sys.exit(0)
+
+    print(f"  [click] {len(collector.pairs)} t2 pairs confirmed")
+    return collector.pairs
 
 
 # ─────────────────────────────────────────────
@@ -341,50 +431,40 @@ def run_click_session(img_crop: np.ndarray,
 
 def show_qc_window(img_t1, img_t2_aligned,
                    results_t1, results_t2,
-                   boundary_row,
                    px_per_mm_t1, px_per_mm_t2,
                    out_path=None):
-    """
-    Show side-by-side QC with traced paths on t1 and t2.
-    Press Enter or close window to proceed to export.
-    """
     fig, axes = plt.subplots(1, 2, figsize=(20, 11),
                              facecolor='#0d0d1a')
     fig.patch.set_facecolor('#0d0d1a')
 
     for ax, img, results, px_per_mm, label in [
         (axes[0], img_t1,         results_t1, px_per_mm_t1, "t1  (annotated)"),
-        (axes[1], img_t2_aligned, results_t2, px_per_mm_t2, "t2  (auto-traced)"),
+        (axes[1], img_t2_aligned, results_t2, px_per_mm_t2, "t2  (verified)"),
     ]:
         ax.set_facecolor('#0d0d1a')
-        overlay = img.copy()
-        cv2.line(overlay,
-                 (0, boundary_row), (overlay.shape[1], boundary_row),
-                 (0, 220, 220), 3)
-        ax.imshow(overlay)
+        ax.imshow(img)
 
         for res in results:
             if not res or not res.get('path'):
                 continue
-            i     = res['label'] - 1
-            color = PALETTE[i % len(PALETTE)]
-            path  = res['path']
-            rows  = [p[0] for p in path]
-            cols  = [p[1] for p in path]
-
+            i      = res['label'] - 1
+            color  = PALETTE[i % len(PALETTE)]
+            path   = res['path']
+            rows   = [p[0] for p in path]
+            cols   = [p[1] for p in path]
             ax.plot(cols, rows, '-', color=color,
                     linewidth=3, alpha=0.85)
-
             sr, sc = res['start']
             ax.plot(sc, sr, 'o', color=color, markersize=11,
                     markeredgecolor='white', markeredgewidth=2)
-
+            er, ec = res['end']
+            ax.plot(ec, er, 's', color=color, markersize=9,
+                    markeredgecolor='white', markeredgewidth=2)
             mm     = res.get('length_mm')
             mm_str = f"{mm:.1f} mm" if mm else f"{res['length_px']:.0f} px"
             mid    = len(path) // 2
             mr, mc = path[mid]
-            ax.text(mc + 12, mr,
-                    f"{res['label']}: {mm_str}",
+            ax.text(mc + 12, mr, f"{res['label']}: {mm_str}",
                     color='white', fontsize=9, fontweight='bold',
                     bbox=dict(boxstyle='round,pad=0.25',
                               facecolor=color, alpha=0.85))
@@ -395,7 +475,7 @@ def show_qc_window(img_t1, img_t2_aligned,
 
     plt.suptitle(
         "QC — Check traced paths match the hypocotyls.\n"
-        "Close this window or press ENTER to save results to Excel.",
+        "Close this window or press ENTER to save results.",
         color='white', fontsize=11, y=0.99
     )
     plt.tight_layout(rect=[0, 0, 1, 0.97])
