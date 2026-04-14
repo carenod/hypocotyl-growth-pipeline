@@ -81,8 +81,12 @@ def main():
 
     if not args.no_align:
         from step2_alignment import align_images
-        crop_t2_aligned, H = align_images(crop_t1, crop_t2, debug=args.debug)
-        print(f"  Alignment done.")
+        landmark_path = str(qc_dir / f"alignment_landmarks_{t1_name}_vs_{t2_name}.png")
+        crop_t2_aligned, H = align_images(crop_t1, crop_t2,
+                                          debug=args.debug,
+                                          save_path=landmark_path)
+        print(f"  Alignment landmarks → {landmark_path}")
+        print(f"  ↑ Open this to check which features were matched")
     else:
         crop_t2_aligned = crop_t2
         H = None
@@ -115,7 +119,8 @@ def main():
     # ── T1 annotation ──
     pairs_t1 = run_t1_session(
         crop_t1,
-        title=f"t1: {t1_path.name}  —  Click COTYLEDON then ROOT TIP per seedling"
+        title=f"t1: {t1_path.name}  —  Click COTYLEDON then ROOT TIP per seedling",
+        image_path=str(t1_path),
     )
 
     # Log which side each seedling is on
@@ -133,30 +138,16 @@ def main():
     print("  STEP 3b – Verify t2 positions")
     print("="*55)
 
-    # Map t1 pairs to t2 via homography
-    if H is not None:
-        H_inv = np.linalg.inv(H)
-        suggested = []
-        for p in pairs_t1:
-            def map_pt(r, c):
-                pt      = np.array([[[float(c), float(r)]]], dtype=np.float32)
-                mapped  = cv2.perspectiveTransform(pt, H_inv)
-                nc, nr  = mapped[0][0]
-                return (int(nr), int(nc))
-            suggested.append({
-                'top'  : map_pt(*p['top']),
-                'bot'  : map_pt(*p['bot']),
-                'color': p['color'],
-            })
-    else:
-        # No alignment — use same coordinates
-        suggested = [{'top': p['top'], 'bot': p['bot'],
-                      'color': p['color']} for p in pairs_t1]
+    # crop_t2_aligned is already warped into t1 coordinate space, so t1 click
+    # positions map directly onto the aligned image — no transformation needed.
+    suggested = [{'top': p['top'], 'bot': p['bot'],
+                  'color': p['color']} for p in pairs_t1]
 
     pairs_t2 = run_t2_session(
         crop_t2_aligned,
         title=f"t2: {t2_path.name}  —  Verify / correct suggested positions",
         suggested_pairs=suggested,
+        image_path=str(t2_path),
     )
 
     # ── Trace t2 ──

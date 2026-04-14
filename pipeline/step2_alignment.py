@@ -10,50 +10,60 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 
-def align_images(img_t1: np.ndarray, img_t2: np.ndarray, debug: bool = False):
+def align_images(img_t1: np.ndarray, img_t2: np.ndarray,
+                 debug: bool = False, save_path: str = None):
     """
     Align img_t2 to img_t1 using ORB keypoints + RANSAC homography.
     Returns:
       img_t2_aligned : warped t2 image in t1 coordinate space
       H              : 3x3 homography matrix (t2 → t1)
+
+    If save_path is given, always saves a landmark QC image there.
     """
     print("\n[Alignment] Computing registration t2 → t1")
 
     gray1 = cv2.cvtColor(img_t1, cv2.COLOR_RGB2GRAY)
     gray2 = cv2.cvtColor(img_t2, cv2.COLOR_RGB2GRAY)
 
-    # ── ORB feature detection ──
     orb = cv2.ORB_create(nfeatures=4000)
     kp1, des1 = orb.detectAndCompute(gray1, None)
     kp2, des2 = orb.detectAndCompute(gray2, None)
 
     if des1 is None or des2 is None or len(kp1) < 10 or len(kp2) < 10:
         print("  [alignment] Not enough keypoints – falling back to translation")
-        return _fallback_translation(img_t1, img_t2, debug)
+        result = _fallback_translation(img_t1, img_t2, debug)
+        if save_path:
+            _save_landmark_image(img_t1, img_t2, result[0], [], [], [], None,
+                                 save_path, method="phase-correlation fallback")
+        return result
 
-    # Brute-force matching
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-    matches = bf.match(des1, des2)
-    matches = sorted(matches, key=lambda m: m.distance)
-
-    # Keep best 40% of matches
-    good = matches[: max(10, int(len(matches) * 0.4))]
+    bf   = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = sorted(bf.match(des1, des2), key=lambda m: m.distance)
+    good    = matches[: max(10, int(len(matches) * 0.4))]
     print(f"  [alignment] {len(kp1)} / {len(kp2)} keypoints, {len(good)} good matches")
 
     if len(good) < 8:
         print("  [alignment] Too few good matches – falling back to translation")
-        return _fallback_translation(img_t1, img_t2, debug)
+        result = _fallback_translation(img_t1, img_t2, debug)
+        if save_path:
+            _save_landmark_image(img_t1, img_t2, result[0], kp1, kp2, good, None,
+                                 save_path, method="phase-correlation fallback")
+        return result
 
     pts1 = np.float32([kp1[m.queryIdx].pt for m in good])
     pts2 = np.float32([kp2[m.trainIdx].pt for m in good])
 
     H, mask = cv2.findHomography(pts2, pts1, cv2.RANSAC, 5.0)
-    inliers = int(mask.sum()) if mask is not None else 0
+    inliers  = int(mask.sum()) if mask is not None else 0
     print(f"  [alignment] Homography inliers: {inliers}/{len(good)}")
 
     if H is None or inliers < 6:
         print("  [alignment] Homography failed – falling back to translation")
-        return _fallback_translation(img_t1, img_t2, debug)
+        result = _fallback_translation(img_t1, img_t2, debug)
+        if save_path:
+            _save_landmark_image(img_t1, img_t2, result[0], kp1, kp2, good, mask,
+                                 save_path, method="phase-correlation fallback")
+        return result
 
     h, w = img_t1.shape[:2]
     img_t2_aligned = cv2.warpPerspective(
@@ -65,13 +75,110 @@ def align_images(img_t1: np.ndarray, img_t2: np.ndarray, debug: bool = False):
     )
     img_t2_aligned = cv2.cvtColor(img_t2_aligned, cv2.COLOR_BGR2RGB)
 
+    if save_path:
+        _save_landmark_image(img_t1, img_t2, img_t2_aligned,
+                             kp1, kp2, good, mask, save_path,
+                             method=f"ORB homography ({inliers} inliers)")
     if debug:
         _show_alignment_debug(img_t1, img_t2, img_t2_aligned, kp1, kp2, good, mask)
 
     return img_t2_aligned, H
 
 
-def _fallback_translation(img_t1, img_t2, debug):
+def _save_landmark_image(img_t1, img_t2, img_t2_aligned,
+                          kp1, kp2, good, mask, save_path, method=""):
+    """
+    Save a 3-panel QC image showing:
+      1. Checkerboard blend before alignment
+      2. Checkerboard blend after alignment
+      3. Feature matches with inliers (green) and outliers (red)
+    Always saved to disk regardless of debug flag.
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+
+    h, w = img_t1.shape[:2]
+    fig, axes = plt.subplots(1, 3, figsize=(22, 7))
+    fig.patch.set_facecolor('#111111')
+
+    # ── Checkerboard panels ──
+    tile = max(40, min(h, w) // 20)
+    checker = np.zeros((h, w), dtype=bool)
+    for r in range(0, h, tile * 2):
+        for c in range(0, w, tile * 2):
+            checker[r:r+tile, c:c+tile] = True
+            checker[r+tile:r+2*tile, c+tile:c+2*tile] = True
+
+    # Resize t2 to t1 size for before-blend if needed
+    t2_resized = cv2.resize(img_t2, (w, h)) if img_t2.shape[:2] != (h, w) else img_t2
+
+    blend_before        = img_t1.copy()
+    blend_before[checker] = t2_resized[checker]
+
+    blend_after         = img_t1.copy()
+    blend_after[checker] = img_t2_aligned[checker]
+
+    axes[0].imshow(blend_before)
+    axes[0].set_title("Before alignment\n(checkerboard: t1 vs t2)",
+                       color='white', fontsize=11)
+    axes[0].axis('off')
+
+    axes[1].imshow(blend_after)
+    axes[1].set_title("After alignment\n(should look like one image)",
+                       color='white', fontsize=11)
+    axes[1].axis('off')
+
+    # ── Match visualisation ──
+    if kp1 and kp2 and good:
+        if mask is not None:
+            inlier_m  = [good[i] for i in range(len(good)) if mask[i]]
+            outlier_m = [good[i] for i in range(len(good)) if not mask[i]]
+        else:
+            inlier_m  = good[:30]
+            outlier_m = []
+
+        # Draw inliers green, outliers red
+        match_img = cv2.drawMatches(
+            cv2.cvtColor(img_t1, cv2.COLOR_RGB2BGR), kp1,
+            cv2.cvtColor(t2_resized, cv2.COLOR_RGB2BGR), kp2,
+            inlier_m[:40], None,
+            matchColor=(0, 220, 0),
+            flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
+        )
+        if outlier_m:
+            match_img = cv2.drawMatches(
+                cv2.cvtColor(img_t1, cv2.COLOR_RGB2BGR), kp1,
+                cv2.cvtColor(t2_resized, cv2.COLOR_RGB2BGR), kp2,
+                outlier_m[:20], match_img,
+                matchColor=(0, 0, 220),
+                flags=(cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS |
+                       cv2.DrawMatchesFlags_DRAW_OVER_OUTIMG)
+            )
+        axes[2].imshow(cv2.cvtColor(match_img, cv2.COLOR_BGR2RGB))
+        axes[2].set_title(
+            f"Landmarks used  [{method}]\n"
+            f"Green = inliers ({len(inlier_m)})  "
+            f"Red = outliers ({len(outlier_m)})",
+            color='white', fontsize=11)
+    else:
+        axes[2].imshow(img_t1)
+        axes[2].set_title(f"No feature matches\n[{method}]",
+                           color='white', fontsize=11)
+    axes[2].axis('off')
+
+    plt.suptitle(
+        "Alignment QC — check that the 'after' checkerboard looks like one image.\n"
+        "If it looks wrong, the alignment failed and t2 positions will need more correction.",
+        color='white', fontsize=10, y=1.01
+    )
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=130, bbox_inches='tight',
+                facecolor=fig.get_facecolor())
+    plt.close()
+    print(f"  [alignment] Landmark QC saved → {save_path}")
+
+
+
     """Phase-correlation based translation-only alignment."""
     h1, w1 = img_t1.shape[:2]
     h2, w2 = img_t2.shape[:2]

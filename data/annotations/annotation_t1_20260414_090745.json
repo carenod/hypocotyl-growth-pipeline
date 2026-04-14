@@ -1,0 +1,200 @@
+{
+  "image_path": "data\\raw\\IMG_1721.JPG",
+  "image_shape": [
+    2324,
+    2834,
+    3
+  ],
+  "timepoint": "t1",
+  "timestamp": "20260414_090745",
+  "n_seedlings": 17,
+  "annotations": [
+    {
+      "seedling_id": 1,
+      "cotyledon_top": [
+        1212,
+        70
+      ],
+      "root_tip": [
+        1314,
+        69
+      ]
+    },
+    {
+      "seedling_id": 2,
+      "cotyledon_top": [
+        1236,
+        189
+      ],
+      "root_tip": [
+        1352,
+        157
+      ]
+    },
+    {
+      "seedling_id": 3,
+      "cotyledon_top": [
+        1177,
+        298
+      ],
+      "root_tip": [
+        1294,
+        324
+      ]
+    },
+    {
+      "seedling_id": 4,
+      "cotyledon_top": [
+        1197,
+        389
+      ],
+      "root_tip": [
+        1276,
+        369
+      ]
+    },
+    {
+      "seedling_id": 5,
+      "cotyledon_top": [
+        1209,
+        648
+      ],
+      "root_tip": [
+        1277,
+        661
+      ]
+    },
+    {
+      "seedling_id": 6,
+      "cotyledon_top": [
+        1201,
+        767
+      ],
+      "root_tip": [
+        1282,
+        836
+      ]
+    },
+    {
+      "seedling_id": 7,
+      "cotyledon_top": [
+        1177,
+        913
+      ],
+      "root_tip": [
+        1278,
+        944
+      ]
+    },
+    {
+      "seedling_id": 8,
+      "cotyledon_top": [
+        1147,
+        979
+      ],
+      "root_tip": [
+        1253,
+        1003
+      ]
+    },
+    {
+      "seedling_id": 9,
+      "cotyledon_top": [
+        1236,
+        1116
+      ],
+      "root_tip": [
+        1302,
+        1125
+      ]
+    },
+    {
+      "seedling_id": 10,
+      "cotyledon_top": [
+        1159,
+        1221
+      ],
+      "root_tip": [
+        1236,
+        1241
+      ]
+    },
+    {
+      "seedling_id": 11,
+      "cotyledon_top": [
+        1184,
+        1751
+      ],
+      "root_tip": [
+        1250,
+        1811
+      ]
+    },
+    {
+      "seedling_id": 12,
+      "cotyledon_top": [
+        1160,
+        1904
+      ],
+      "root_tip": [
+        1245,
+        1888
+      ]
+    },
+    {
+      "seedling_id": 13,
+      "cotyledon_top": [
+        1168,
+        1980
+      ],
+      "root_tip": [
+        1265,
+        1972
+      ]
+    },
+    {
+      "seedling_id": 14,
+      "cotyledon_top": [
+        1209,
+        2333
+      ],
+      "root_tip": [
+        1297,
+        2313
+      ]
+    },
+    {
+      "seedling_id": 15,
+      "cotyledon_top": [
+        1187,
+        2477
+      ],
+      "root_tip": [
+        1245,
+        2455
+      ]
+    },
+    {
+      "seedling_id": 16,
+      "cotyledon_top": [
+        1206,
+        2612
+      ],
+      "root_tip": [
+        1293,
+        2614
+      ]
+    },
+    {
+      "seedling_id": 17,
+      "cotyledon_top": [
+        1228,
+        2727
+      ],
+      "root_tip": [
+        1288,
+        2675
+      ]
+    }
+  ]
+}

@@ -12,6 +12,9 @@ import matplotlib
 import matplotlib.pyplot as plt
 import cv2
 import sys
+import json
+import os
+from datetime import datetime
 
 for backend in ['TkAgg', 'Qt5Agg', 'WXAgg']:
     try:
@@ -25,6 +28,91 @@ PALETTE = [
     '#FF64FF', '#64FFFF', '#FFA040', '#40FFA0',
     '#A040FF', '#FF4080', '#40FF80', '#8040FF',
 ]
+
+PIPELINE_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(PIPELINE_DIR)
+ANNOTATIONS_DIR = os.path.join(PROJECT_ROOT, "data", "annotations")
+
+
+# ─────────────────────────────────────────────
+#  Zoom / pan handler (scroll wheel + middle drag)
+# ─────────────────────────────────────────────
+
+class ZoomPan:
+    """
+    Adds scroll-to-zoom and pan to a matplotlib axes.
+    Pan modes: middle-click drag OR hold Space + left-click drag.
+    Attach after creating the axes, before showing.
+    """
+    def __init__(self, ax):
+        self.ax          = ax
+        self._drag       = None   # (x, y, xlim, ylim) when dragging
+        self.space_held  = False  # True while Space is held down
+        self._cids       = []
+        fig = ax.figure
+        self._cids.append(fig.canvas.mpl_connect('scroll_event',         self._zoom))
+        self._cids.append(fig.canvas.mpl_connect('button_press_event',   self._pan_start))
+        self._cids.append(fig.canvas.mpl_connect('button_release_event', self._pan_end))
+        self._cids.append(fig.canvas.mpl_connect('motion_notify_event',  self._pan_move))
+        self._cids.append(fig.canvas.mpl_connect('key_press_event',      self._key_press))
+        self._cids.append(fig.canvas.mpl_connect('key_release_event',    self._key_release))
+
+    def _key_press(self, event):
+        if event.key == ' ':
+            self.space_held = True
+
+    def _key_release(self, event):
+        if event.key == ' ':
+            self.space_held = False
+            self._drag = None
+
+    def _zoom(self, event):
+        if event.inaxes != self.ax:
+            return
+        xdata, ydata = event.xdata, event.ydata
+        if xdata is None:
+            return
+        factor = 0.85 if event.button == 'up' else 1.0 / 0.85
+        xl = self.ax.get_xlim()
+        yl = self.ax.get_ylim()
+        new_xl = [xdata + (x - xdata) * factor for x in xl]
+        new_yl = [ydata + (y - ydata) * factor for y in yl]
+        self.ax.set_xlim(new_xl)
+        self.ax.set_ylim(new_yl)
+        self.ax.figure.canvas.draw_idle()
+
+    def _pan_start(self, event):
+        if event.inaxes != self.ax:
+            return
+        if event.button == 2 or (event.button == 1 and self.space_held):
+            # Store in display pixels — these are stable across xlim changes
+            self._drag = (event.x, event.y)
+
+    def _pan_end(self, event):
+        if event.button in (1, 2):
+            self._drag = None
+
+    def _pan_move(self, event):
+        if self._drag is None or event.inaxes != self.ax:
+            return
+        x_prev, y_prev = self._drag
+        dx_px = event.x - x_prev
+        dy_px = event.y - y_prev
+
+        ax   = self.ax
+        bbox = ax.get_window_extent()
+        xl   = ax.get_xlim()
+        yl   = ax.get_ylim()
+
+        # Convert pixel delta to data-space delta and pan
+        # (formula handles inverted image y-axis correctly)
+        if bbox.width > 0 and bbox.height > 0:
+            ax.set_xlim([v - dx_px / bbox.width  * (xl[1] - xl[0]) for v in xl])
+            ax.set_ylim([v - dy_px / bbox.height * (yl[1] - yl[0]) for v in yl])
+
+        # Update anchor each frame — avoids coordinate-system drift
+        self._drag = (event.x, event.y)
+        ax.figure.canvas.draw_idle()
 
 
 # ─────────────────────────────────────────────
@@ -40,7 +128,7 @@ class T1Collector:
     Each pair = one seedling.
     """
 
-    def __init__(self, ax, img_shape):
+    def __init__(self, ax, img_shape, zoom_pan=None):
         self.ax        = ax
         self.h, self.w = img_shape[:2]
         self.pairs     = []          # list of {'top': (r,c), 'bot': (r,c)}
@@ -48,6 +136,12 @@ class T1Collector:
         self._artists  = []          # for undo
         self._confirmed = False
         self._n_clicks  = 0
+        self._zoom_pan  = zoom_pan   # used to suppress clicks during pan
+        self._cursor_moved = False   # must move mouse before first click registers
+
+        fig = ax.figure
+        fig.canvas.mpl_connect('motion_notify_event', self._on_motion)
+        fig.canvas.mpl_connect('figure_leave_event',  self._on_leave)
 
         self._status = ax.text(
             0.01, 0.015,
@@ -58,6 +152,14 @@ class T1Collector:
                       facecolor='#1a6e1a', alpha=0.92),
             va='bottom', zorder=10,
         )
+
+    def _on_motion(self, event):
+        if event.inaxes == self.ax:
+            self._cursor_moved = True
+
+    def _on_leave(self, event):
+        # Reset when mouse leaves the figure so a re-focus click is suppressed
+        self._cursor_moved = False
 
     def _step_msg(self):
         n = len(self.pairs)
@@ -78,6 +180,14 @@ class T1Collector:
         if event.button == 3:
             self._undo()
             return
+
+        # Only annotate on plain left-click; ignore middle-click and space+drag
+        if event.button != 1:
+            return
+        if self._zoom_pan and self._zoom_pan.space_held:
+            return
+        if not self._cursor_moved:
+            return  # suppress window-focus click (mouse hasn't moved yet)
 
         r, c = int(y), int(x)
         self._n_clicks += 1
@@ -172,7 +282,7 @@ class T2Collector:
       - Right-click a pair number to delete the whole pair
     """
 
-    def __init__(self, ax, img_shape, suggested_pairs):
+    def __init__(self, ax, img_shape, suggested_pairs, zoom_pan=None):
         self.ax          = ax
         self.h, self.w   = img_shape[:2]
         self.pairs       = [{'top': p['top'], 'bot': p['bot'],
@@ -181,6 +291,12 @@ class T2Collector:
         self._artists    = []
         self._confirmed  = False
         self._selected   = None   # (pair_idx, 'top'|'bot') being moved
+        self._zoom_pan   = zoom_pan
+        self._cursor_moved = False
+
+        fig = ax.figure
+        fig.canvas.mpl_connect('motion_notify_event', self._on_motion)
+        fig.canvas.mpl_connect('figure_leave_event',  self._on_leave)
 
         self._status = ax.text(
             0.01, 0.015,
@@ -193,6 +309,13 @@ class T2Collector:
             va='bottom', zorder=10,
         )
         self._draw_all()
+
+    def _on_motion(self, event):
+        if event.inaxes == self.ax:
+            self._cursor_moved = True
+
+    def _on_leave(self, event):
+        self._cursor_moved = False
 
     def _draw_all(self):
         for a in self._artists:
@@ -261,6 +384,11 @@ class T2Collector:
             return
 
         if event.button == 1:
+            # Ignore if space is held (pan mode) or mouse hasn't moved yet
+            if self._zoom_pan and self._zoom_pan.space_held:
+                return
+            if not self._cursor_moved:
+                return
             # Left-click: move nearest point
             if self._selected is None:
                 hit = self._nearest_point(r, c)
@@ -309,31 +437,70 @@ def _instruction_panel(fig, lines):
                   transform=ax_i.transAxes, clip_on=True)
 
 
-def run_t1_session(img_crop: np.ndarray, title: str) -> list:
+def _save_annotation(image_path: str, img_shape: tuple,
+                      pairs: list, timepoint: str):
+    """
+    Save annotation session to JSON for future model training.
+    Each session = one image crop with labeled cotyledon tops + root tips.
+    """
+    os.makedirs(ANNOTATIONS_DIR, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fname = os.path.join(
+        ANNOTATIONS_DIR,
+        f"annotation_{timepoint}_{timestamp}.json"
+    )
+    data = {
+        "image_path"  : str(image_path),
+        "image_shape" : list(img_shape),
+        "timepoint"   : timepoint,
+        "timestamp"   : timestamp,
+        "n_seedlings" : len(pairs),
+        "annotations" : [
+            {
+                "seedling_id"    : i + 1,
+                "cotyledon_top"  : list(p['top']),   # [row, col]
+                "root_tip"       : list(p['bot']),   # [row, col]
+            }
+            for i, p in enumerate(pairs)
+        ]
+    }
+    with open(fname, 'w') as f:
+        json.dump(data, f, indent=2)
+    print(f"  [training data] Saved → {fname}")
+    print(f"  [training data] Total annotations: "
+          f"{len(list(os.scandir(ANNOTATIONS_DIR)))} sessions in {ANNOTATIONS_DIR}")
+
+
+def run_t1_session(img_crop: np.ndarray, title: str,
+                   image_path: str = "") -> list:
     """
     Returns list of dicts: [{'top': (r,c), 'bot': (r,c), 'color': hex}, ...]
-    top = cotyledon position, bot = root tip / hypocotyl bottom
+    Also saves annotation to data/annotations/ for model training.
+    Scroll wheel = zoom, middle-click drag = pan.
     """
     fig = plt.figure(figsize=(18, 10), facecolor='#0d0d1a')
     ax  = fig.add_axes([0.01, 0.05, 0.70, 0.90])
     ax.set_facecolor('#0d0d1a')
     ax.imshow(img_crop)
-    ax.set_title(title, color='white', fontsize=12, fontweight='bold', pad=8)
+    ax.set_title(title + "\n"
+                 "Scroll=zoom  Space+drag=pan  Middle-drag=pan  "
+                 "Left=annotate  Right=undo  Enter=confirm",
+                 color='white', fontsize=10, fontweight='bold', pad=8)
     ax.axis('off')
 
     _instruction_panel(fig, [
         ("T1 ANNOTATION", "#FFD700", True),
         ("", "white", False),
-        ("Click PAIRS per seedling:", "#64FFFF", True),
+        ("NAVIGATE:", "#64FFFF", True),
+        ("  Scroll = zoom in/out", "white", False),
+        ("  SPACE + drag = pan", "white", False),
+        ("  Middle-drag = pan", "white", False),
         ("", "white", False),
+        ("ANNOTATE (pairs):", "#64FF64", True),
         ("  1st click = COTYLEDON TOP", "#64FF64", False),
-        ("     (green leaf at top of plant)", "white", False),
-        ("     → green circle ▲ appears", "#64FF64", False),
-        ("", "white", False),
+        ("     (green leaf, top of plant)", "white", False),
         ("  2nd click = ROOT TIP", "#FF9040", False),
-        ("     (where hypocotyl ends,", "white", False),
-        ("      root begins)", "white", False),
-        ("     → square ▼ + dashed line", "#FF9040", False),
+        ("     (where root begins)", "white", False),
         ("", "white", False),
         ("Repeat for every seedling.", "white", False),
         ("Both left AND right side.", "white", False),
@@ -344,57 +511,65 @@ def run_t1_session(img_crop: np.ndarray, title: str) -> list:
         ("  ENTER = confirm all", "#AAFFAA", False),
     ])
 
-    collector = T1Collector(ax, img_crop.shape)
+    zp = ZoomPan(ax)
+    collector = T1Collector(ax, img_crop.shape, zoom_pan=zp)
     fig.canvas.mpl_connect('button_press_event', collector.on_click)
     fig.canvas.mpl_connect('key_press_event',    collector.on_key)
 
     print("\n" + "─"*60)
-    print("  T1 ANNOTATION WINDOW")
+    print("  T1 ANNOTATION  (scroll=zoom, Space+drag=pan, middle-drag=pan)")
     print("─"*60)
-    print("  For each seedling, click TWO points:")
-    print("  1st click → COTYLEDON TOP (green leaf above hypocotyl)")
-    print("  2nd click → ROOT TIP (where hypocotyl ends, root begins)")
-    print("  Repeat for all seedlings (left + right side)")
-    print("  Right-click = undo last | ENTER = confirm")
+    print("  Per seedling: 1st click COTYLEDON TOP, 2nd click ROOT TIP")
+    print("  Right-click = undo | ENTER = confirm")
     print("─"*60)
 
     plt.show(block=True)
 
     if not collector._confirmed or not collector.pairs:
         print("  No annotations — exiting.")
-        import sys; sys.exit(0)
+        sys.exit(0)
 
+    _save_annotation(image_path, img_crop.shape, collector.pairs, "t1")
     print(f"  [click] {len(collector.pairs)} seedlings annotated")
     return collector.pairs
 
 
 def run_t2_session(img_t2: np.ndarray, title: str,
-                   suggested_pairs: list) -> list:
+                   suggested_pairs: list,
+                   image_path: str = "") -> list:
     """
     Show t2 with suggested pairs pre-populated.
+    Scroll wheel = zoom, middle-click drag = pan.
     User verifies/corrects. Returns confirmed pairs.
+    Also saves annotation to data/annotations/.
     """
     fig = plt.figure(figsize=(18, 10), facecolor='#0d0d1a')
     ax  = fig.add_axes([0.01, 0.05, 0.70, 0.90])
     ax.set_facecolor('#0d0d1a')
     ax.imshow(img_t2)
-    ax.set_title(title, color='white', fontsize=12, fontweight='bold', pad=8)
+    ax.set_title(title + "\n"
+                 "Scroll=zoom  Space+drag=pan  Middle-drag=pan  "
+                 "Left-click dot=move  Right-click=delete  Enter=confirm",
+                 color='white', fontsize=10, fontweight='bold', pad=8)
     ax.axis('off')
 
     _instruction_panel(fig, [
         ("T2 VERIFICATION", "#FFD700", True),
         ("", "white", False),
-        ("Suggested positions shown.", "white", False),
-        ("Check each seedling:", "#64FFFF", True),
+        ("NAVIGATE:", "#64FFFF", True),
+        ("  Scroll = zoom in/out", "white", False),
+        ("  SPACE + drag = pan", "white", False),
+        ("  Middle-drag = pan", "white", False),
         ("", "white", False),
+        ("CHECK positions:", "#64FF64", True),
         ("  ▲ circle = cotyledon top", "#64FF64", False),
         ("  ▼ square = root tip", "#FF9040", False),
         ("", "white", False),
-        ("To MOVE a point:", "#FFFF64", True),
-        ("  Left-click the dot,", "white", False),
-        ("  then left-click new position", "white", False),
+        ("MOVE a point:", "#FFFF64", True),
+        ("  Left-click near dot,", "white", False),
+        ("  then click new position", "white", False),
         ("", "white", False),
-        ("To DELETE a seedling:", "#FFAAAA", True),
+        ("DELETE a seedling:", "#FFAAAA", True),
         ("  Right-click near its number", "white", False),
         ("", "white", False),
         ("─" * 35, "#444444", False),
@@ -402,12 +577,13 @@ def run_t2_session(img_t2: np.ndarray, title: str,
         ("  ENTER = accept all", "#AAFFAA", False),
     ])
 
-    collector = T2Collector(ax, img_t2.shape, suggested_pairs)
+    zp = ZoomPan(ax)
+    collector = T2Collector(ax, img_t2.shape, suggested_pairs, zoom_pan=zp)
     fig.canvas.mpl_connect('button_press_event', collector.on_click)
     fig.canvas.mpl_connect('key_press_event',    collector.on_key)
 
     print("\n" + "─"*60)
-    print("  T2 VERIFICATION WINDOW")
+    print("  T2 VERIFICATION  (scroll=zoom, Space+drag=pan, middle-drag=pan)")
     print("─"*60)
     print("  Suggested positions pre-filled from t1 + alignment.")
     print("  Left-click a dot → left-click new position to move it.")
@@ -419,8 +595,9 @@ def run_t2_session(img_t2: np.ndarray, title: str,
 
     if not collector._confirmed or not collector.pairs:
         print("  No pairs confirmed — exiting.")
-        import sys; sys.exit(0)
+        sys.exit(0)
 
+    _save_annotation(image_path, img_t2.shape, collector.pairs, "t2")
     print(f"  [click] {len(collector.pairs)} t2 pairs confirmed")
     return collector.pairs
 
@@ -472,10 +649,11 @@ def show_qc_window(img_t1, img_t2_aligned,
         ax.set_title(label, color='white', fontsize=13,
                      fontweight='bold', pad=6)
         ax.axis('off')
+        ZoomPan(ax)
 
     plt.suptitle(
         "QC — Check traced paths match the hypocotyls.\n"
-        "Close this window or press ENTER to save results.",
+        "Scroll = zoom   Space+drag / middle-drag = pan   ENTER = save & continue",
         color='white', fontsize=11, y=0.99
     )
     plt.tight_layout(rect=[0, 0, 1, 0.97])

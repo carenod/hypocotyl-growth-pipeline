@@ -31,12 +31,13 @@ def compute_vesselness(img: np.ndarray) -> np.ndarray:
     """
     gray = rgb2gray(img).astype(np.float64)
 
-    # Frangi at multiple scales matching hypocotyl width
-    # At 33px/mm, hypocotyls are ~30-80px wide → sigmas 5-25
+    # Frangi sigma = expected half-width of the ridge.
+    # Hypocotyls are typically 0.2–1.0 mm wide (thin plant stems).
+    # sigma_min ≈ 0.1 mm half-width, sigma_max ≈ 0.5 mm half-width.
     px_per_mm = getattr(config, 'PX_PER_MM_HINT', 33.0)
-    width_min  = max(3,  int(px_per_mm * 0.5))   # ~0.5mm
-    width_max  = max(10, int(px_per_mm * 2.0))   # ~2mm
-    n_scales   = 6
+    width_min  = max(2,  int(px_per_mm * 0.10))   # ~0.1 mm
+    width_max  = max(6,  int(px_per_mm * 0.50))   # ~0.5 mm
+    n_scales   = 5
     sigmas     = np.linspace(width_min, width_max, n_scales)
 
     vessel = frangi(
@@ -57,23 +58,18 @@ def compute_vesselness(img: np.ndarray) -> np.ndarray:
 #  Dijkstra shortest path downward
 # ─────────────────────────────────────────────
 
-def _cost_map(vessel: np.ndarray, col_center: int,
-              col_half_width: int) -> np.ndarray:
+def _cost_map(vessel: np.ndarray, c_min: int, c_max: int) -> np.ndarray:
     """
-    Build cost map from vesselness within a column band around col_center.
+    Build cost map from vesselness within the column band [c_min, c_max].
     Cost = 1 - vesselness  (low cost along filaments).
-    Outside the column band cost is infinity (path cannot escape sideways).
+    Outside the band cost is infinity.
     """
     h, w = vessel.shape
     cost = np.full((h, w), fill_value=np.inf, dtype=np.float32)
-
-    c0 = max(0, col_center - col_half_width)
-    c1 = min(w, col_center + col_half_width + 1)
-
+    c0 = max(0, c_min)
+    c1 = min(w, c_max + 1)
     cost[:, c0:c1] = 1.0 - vessel[:, c0:c1]
-    # Small floor so path always has finite cost even on dark pixels
     cost[:, c0:c1] = np.clip(cost[:, c0:c1], 0.05, 1.0)
-
     return cost
 
 
@@ -144,36 +140,56 @@ def trace_hypocotyl(img: np.ndarray,
                     vessel: np.ndarray,
                     click_row: int, click_col: int,
                     boundary_row: int,
+                    end_col: int = None,
                     col_half_width: int = None) -> dict:
     """
-    Trace one hypocotyl from a cotyledon click point to the boundary line.
+    Trace one hypocotyl from a cotyledon click to the root-tip click.
 
     Args:
         img          : RGB image (full side crop)
         vessel       : precomputed Frangi vesselness map
-        click_row    : row of the cotyledon click
-        click_col    : col of the cotyledon click
-        boundary_row : row of the user-drawn bottom boundary
-        col_half_width : horizontal search width (px); default from config
+        click_row    : row of the cotyledon (top) click
+        click_col    : col of the cotyledon (top) click
+        boundary_row : row of the root-tip (bottom) click
+        end_col      : col of the root-tip click (provides lateral guidance)
+        col_half_width : extra horizontal margin beyond the click columns
 
-    Returns dict with:
-        path         : list of (row, col) — the skeleton path
-        length_px    : arc length in pixels
-        length_mm    : arc length in mm (if px_per_mm known)
-        mask         : bool array with path pixels set
+    Returns dict with path, length_px, length_mm, mask.
     """
     h, w = img.shape[:2]
 
+    px_per_mm = getattr(config, 'PX_PER_MM_HINT', 33.0)
     if col_half_width is None:
-        px_per_mm     = getattr(config, 'PX_PER_MM_HINT', 33.0)
         col_half_width = int(px_per_mm * config.TRACER_COLUMN_WIDTH_MM)
 
     # Clamp inputs
-    start_row = max(0, min(click_row, h - 1))
-    start_col = max(0, min(click_col, w - 1))
+    start_row = max(0, min(click_row,    h - 1))
+    start_col = max(0, min(click_col,    w - 1))
     end_row   = max(start_row + 5, min(boundary_row, h - 1))
+    if end_col is None:
+        end_col = start_col
+    end_col   = max(0, min(end_col, w - 1))
 
-    cost = _cost_map(vessel, start_col, col_half_width)
+    # Column band covers both click columns plus a fixed margin
+    c_min = min(start_col, end_col) - col_half_width
+    c_max = max(start_col, end_col) + col_half_width
+    cost  = _cost_map(vessel, c_min, c_max)
+
+    # ── Lateral guidance ─────────────────────────────────────────────────
+    # Add a small extra cost for pixels that deviate from the straight line
+    # between the two clicks.  This steers the path toward the hypocotyl
+    # without overriding the vesselness signal.
+    n_rows  = end_row - start_row
+    if n_rows > 0 and start_col != end_col:
+        rows    = np.arange(h, dtype=float)
+        t       = np.clip((rows - start_row) / n_rows, 0.0, 1.0)
+        exp_col = start_col + t * (end_col - start_col)          # shape (h,)
+        cols    = np.arange(w, dtype=float)
+        lateral = np.abs(cols[np.newaxis, :] - exp_col[:, np.newaxis]) \
+                  / max(col_half_width, 1)                        # shape (h, w)
+        finite  = ~np.isinf(cost)
+        cost[finite] += 0.3 * np.minimum(lateral[finite], 1.0)
+
     path = dijkstra_downward(cost, start_row, start_col, end_row)
 
     # Arc length (diagonal steps = sqrt(2))
@@ -225,9 +241,9 @@ def trace_all(img: np.ndarray,
 
     results = []
     for i, pair in enumerate(pairs):
-        cr, cc    = pair['top']
-        bot_r, _  = pair['bot']   # use the row of the bottom click as boundary
-        result = trace_hypocotyl(img, vessel, cr, cc, bot_r)
+        cr,    cc    = pair['top']
+        bot_r, bot_c = pair['bot']
+        result = trace_hypocotyl(img, vessel, cr, cc, bot_r, end_col=bot_c)
         result['label'] = i + 1
         result['click'] = (cr, cc)
         result['color'] = pair.get('color', PALETTE[i % len(PALETTE)])
