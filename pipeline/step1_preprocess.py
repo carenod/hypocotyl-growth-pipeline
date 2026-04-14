@@ -9,6 +9,8 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
+from scipy.signal import find_peaks
+from scipy.ndimage import gaussian_filter1d
 import config
 
 
@@ -118,97 +120,120 @@ def detect_plate_roi(img: np.ndarray, debug: bool = False):
     return x, y, w, h
 
 
-def _filter_peaks_consistent(peaks: np.ndarray, tolerance: float = 0.35) -> np.ndarray:
-    """Keep only peaks connected by spacings within `tolerance` of the median."""
-    if len(peaks) < 3:
-        return peaks
-    spacings   = np.diff(peaks)
-    median_sp  = np.median(spacings)
-    consistent = np.abs(spacings - median_sp) / (median_sp + 1e-6) < tolerance
-    keep = np.zeros(len(peaks), dtype=bool)
-    for i in range(len(spacings)):
-        if consistent[i]:
-            keep[i] = keep[i + 1] = True
-    return peaks[keep]
-
-
 def detect_px_per_mm(img: np.ndarray, plate_roi, debug: bool = False):
     """
     Detect ruler tick spacing and return px/mm.
 
-    Uses the mean grayscale per row (one dip per tick, no Canny double-edges),
-    a median-filter background subtraction, and simple peak finding.
+    1. Detect candidate tick rows as peaks in the per-row 5th-percentile
+       brightness (permissive — some false, some missed).
+    2. Grid search: for every integer period d and every phase, count how
+       many detected peaks fall within 4 px of a grid position.  The
+       (d, phase) with the highest count is the best-fitting evenly-spaced
+       grid.
+    3. Snap: return tick positions at exactly phase + k*d.
 
     Returns (px_per_mm, display_peaks, ruler_strip).
     """
-    from scipy.signal import find_peaks, savgol_filter
-    from scipy.ndimage import median_filter as mfilt
-
     x, y, w, h = plate_roi
     img_h, img_w = img.shape[:2]
     ruler_x     = x + w
     ruler_strip = img[y: y + h, ruler_x: img_w]
     rs_h, rs_w  = ruler_strip.shape[:2]
 
-    gray = cv2.cvtColor(ruler_strip, cv2.COLOR_RGB2GRAY).astype(float)
+    # ── Color-based signal ───────────────────────────────────────────────
+    # Pink background: R >> G  →  (R - G) is large and positive
+    # White ticks:     R ≈ G   →  (R - G) is near zero
+    # Row minimum of (R-G): lowest value in each row.
+    # A white tick crossing that row pulls the minimum toward zero.
+    # Rows without ticks stay pink → high (R-G).
+    # Invert so tick rows become peaks.
+    r = ruler_strip[:, :, 0].astype(float)
+    g = ruler_strip[:, :, 1].astype(float)
+    redness = r - g                              # high=pink, low=white
 
-    # Use the central 70 % of the ruler width (avoids edges and number labels)
-    c0 = max(0,    int(rs_w * 0.15))
-    c1 = min(rs_w, int(rs_w * 0.85))
-    row_mean = gray[:, c0:c1].mean(axis=1)
+    c0 = max(0,    int(rs_w * 0.05))
+    c1 = min(rs_w, int(rs_w * 0.95))
 
-    # Background detrend: median filter over ~15 % of strip height
-    bg_win = max(21, min(int(rs_h * 0.15), 301))
-    bg_win = bg_win | 1   # must be odd
-    background = mfilt(row_mean, size=bg_win)
-    signal = background - row_mean   # positive = darker than local bg = tick
+    row_min_red = redness[:, c0:c1].min(axis=1)
+    signal      = gaussian_filter1d(row_min_red.max() - row_min_red, sigma=2.0)
 
-    # Light smoothing
-    if rs_h > 15:
-        signal = savgol_filter(signal, min(11, rs_h | 1), 3)
-
-    # Find peaks, trying a range of prominence thresholds
-    peaks = np.array([], dtype=int)
-    for prom_frac in (0.15, 0.08, 0.04):
-        peaks, _ = find_peaks(signal,
-                               distance=10,
-                               prominence=signal.max() * prom_frac)
-        if len(peaks) >= 5:
+    # ── Step 1: detect candidate peaks (permissive) ──────────────────────
+    raw_peaks = np.array([], dtype=int)
+    for prom_frac in (0.04, 0.02, 0.01):
+        raw_peaks, _ = find_peaks(signal, distance=10,
+                                   prominence=signal.max() * prom_frac)
+        if len(raw_peaks) >= 4:
             break
 
-    if len(peaks) < 2:
-        print("  [ruler] Not enough tick marks found.")
+    if len(raw_peaks) < 3:
+        print("  [ruler] Not enough tick marks detected.")
         return None, np.array([]), ruler_strip
 
-    # Keep only the regularly-spaced chain
-    peaks = _filter_peaks_consistent(peaks)
+    # ── Step 2: grid search — find (period, phase) with most peaks ───────
+    n   = len(signal)
+    tol = 4            # px — a detected peak must be within this of a grid line
 
-    if len(peaks) < 2:
-        print("  [ruler] Ticks too irregular to calibrate.")
+    # Search periods from 12 px up to n/3 (need at least 3 ticks visible)
+    d_min = 12
+    d_max = min(120, n // 3)
+
+    best_count  = 0
+    best_period = 30.0
+    best_phase  = 0.0
+
+    peaks_f = raw_peaks.astype(float)
+
+    for d in range(d_min, d_max + 1):
+        phases = peaks_f % d                          # (n_peaks,)
+        ph_arr = np.arange(d, dtype=float)            # (d,)
+        diff   = np.abs(phases[:, None] - ph_arr)     # (n_peaks, d)
+        diff   = np.minimum(diff, d - diff)           # circular
+        counts = (diff <= tol).sum(axis=0)            # (d,)
+        idx    = int(np.argmax(counts))
+        cnt    = int(counts[idx])
+        if cnt > best_count:
+            best_count  = cnt
+            best_period = float(d)
+            best_phase  = float(idx)
+
+    # ── Step 3: evenly-spaced tick positions ─────────────────────────────
+    ticks = np.arange(best_phase, n, best_period)
+    ticks = np.round(ticks).astype(int)
+    ticks = ticks[(ticks >= 0) & (ticks < n)]
+
+    if len(ticks) < 2:
+        print("  [ruler] Grid fit produced too few ticks.")
         return None, np.array([]), ruler_strip
 
-    spacings       = np.diff(peaks)
-    median_spacing = float(np.median(spacings))
-    px_per_mm      = median_spacing / config.RULER_TICK_MM
+    px_per_mm = best_period / config.RULER_TICK_MM
 
-    # Display the 12 peaks closest to the middle of the detected range
-    mid   = len(peaks) // 2
-    start = max(0, mid - 6)
-    display_peaks = peaks[start: start + 12]
+    # Show up to 12 ticks centred on the fitted range
+    mid           = len(ticks) // 2
+    start         = max(0, mid - 6)
+    display_peaks = ticks[start: start + 12]
 
-    print(f"  [ruler] {len(peaks)} ticks, "
-          f"spacing = {median_spacing:.1f} px → {px_per_mm:.2f} px/mm")
+    print(f"  [ruler] {len(raw_peaks)} peaks detected  →  "
+          f"period={best_period:.0f} px, phase={best_phase:.0f}, "
+          f"explains {best_count}/{len(raw_peaks)} peaks  "
+          f"→  {px_per_mm:.2f} px/mm")
 
     if debug:
         fig, axes = plt.subplots(1, 2, figsize=(10, 5))
         axes[0].imshow(ruler_strip)
+        for p in raw_peaks:
+            axes[0].axhline(p, color='yellow', linewidth=0.8, alpha=0.6)
         for p in display_peaks:
-            axes[0].axhline(p, color='cyan', linewidth=1.0, alpha=0.8)
-        axes[0].set_title("Ruler — detected ticks (cyan)")
+            axes[0].axhline(p, color='cyan', linewidth=1.2, alpha=0.9)
+        axes[0].set_title("Yellow=detected  Cyan=corrected (evenly spaced)")
         axes[0].axis("off")
-        axes[1].plot(signal, label='signal')
-        axes[1].plot(peaks, signal[peaks], 'rx', label='peaks')
-        axes[1].set_title("Detrended row profile")
+        axes[1].plot(signal, label='row maximum')
+        axes[1].plot(raw_peaks, signal[raw_peaks], 'y+', ms=8,
+                     label=f'detected ({len(raw_peaks)})')
+        for p in ticks:
+            axes[1].axvline(p, color='cyan', linewidth=0.7, alpha=0.6)
+        axes[1].set_title(f"period={best_period:.0f} px  "
+                          f"phase={best_phase:.0f}  "
+                          f"({best_count} peaks match)")
         axes[1].set_xlabel("Row (px)")
         axes[1].legend()
         plt.tight_layout()
@@ -240,6 +265,10 @@ def verify_calibration(ruler_strip: np.ndarray, peaks: np.ndarray,
         except Exception:
             continue
 
+    # Disable the matplotlib toolbar so it doesn't intercept left-clicks
+    _saved_toolbar = matplotlib.rcParams.get('toolbar', 'toolbar2')
+    matplotlib.rcParams['toolbar'] = 'None'
+
     rs_h, rs_w = ruler_strip.shape[:2]
     has_peaks  = len(peaks) > 0
 
@@ -260,6 +289,7 @@ def verify_calibration(ruler_strip: np.ndarray, peaks: np.ndarray,
     }
 
     fig = plt.figure(figsize=(13, 9), facecolor='#0d0d1a')
+    matplotlib.rcParams['toolbar'] = _saved_toolbar   # restore for other windows
     ax_r = fig.add_axes([0.03, 0.05, 0.54, 0.92])
     ax_i = fig.add_axes([0.62, 0.05, 0.36, 0.92])
     for ax in (ax_r, ax_i):
@@ -305,7 +335,7 @@ def verify_calibration(ruler_strip: np.ndarray, peaks: np.ndarray,
                                       facecolor='#FF5050', alpha=0.9),
                             zorder=7)
             ref_artists += [ln, lbl]
-        fig.canvas.draw_idle()
+        fig.canvas.draw()
 
     def redraw_info():
         ax_i.cla()
@@ -372,26 +402,36 @@ def verify_calibration(ruler_strip: np.ndarray, peaks: np.ndarray,
                       fontweight='bold' if bold else 'normal',
                       fontfamily='monospace', va='top',
                       transform=ax_i.transAxes, clip_on=True)
-        fig.canvas.draw_idle()
+        fig.canvas.draw()
 
     # ── event handlers ───────────────────────────
     def on_click(event):
-        if event.inaxes != ax_r or state['confirmed']:
+        if state['confirmed']:
             return
-        if event.button == 3:          # right-click → reset
+
+        # Right-click anywhere → reset
+        if event.button == 3:
             state['refs'].clear()
             state['ref_mm']    = 10
             state['px_per_mm'] = px_per_mm_auto
             redraw_refs(); redraw_info()
             return
-        if event.button != 1 or event.ydata is None:
+
+        if event.button != 1:
             return
 
-        y = float(event.ydata)         # exact click position, no snap
+        # Ignore clicks in the info panel or with no valid coordinates
+        if event.inaxes == ax_i or event.ydata is None:
+            return
+
+        # Accept clicks with y in the ruler strip pixel range
+        y = float(event.ydata)
+        if not (-rs_h * 0.1 <= y <= rs_h * 1.1):
+            return
+
         if len(state['refs']) < 2:
             state['refs'].append(y)
         else:
-            # Move whichever of A / B is nearest to the click
             dA = abs(y - state['refs'][0])
             dB = abs(y - state['refs'][1])
             state['refs'][0 if dA <= dB else 1] = y
@@ -411,7 +451,7 @@ def verify_calibration(ruler_strip: np.ndarray, peaks: np.ndarray,
         yl = ax_r.get_ylim()
         ax_r.set_xlim([xd + (v - xd) * f for v in xl])
         ax_r.set_ylim([yd + (v - yd) * f for v in yl])
-        fig.canvas.draw_idle()
+        fig.canvas.draw()
 
     def on_key(event):
         if event.key == 'enter':
@@ -431,7 +471,7 @@ def verify_calibration(ruler_strip: np.ndarray, peaks: np.ndarray,
 
     fig.canvas.mpl_connect('button_press_event', on_click)
     fig.canvas.mpl_connect('scroll_event',       on_scroll)
-    fig.canvas.mpl_connect('key_press_event',    on_key)
+    fig.canvas.mpl_connect('key_press_event',      on_key)
 
     redraw_info()
     plt.show(block=True)
@@ -464,7 +504,7 @@ def detect_dividing_line(img_crop: np.ndarray, debug: bool = False) -> int:
     # Column-sum profile
     col_profile = edges.sum(axis=0).astype(float)
 
-    from scipy.signal import find_peaks, savgol_filter
+    from scipy.signal import savgol_filter
     if len(col_profile) > 11:
         col_profile = savgol_filter(col_profile, 11, 3)
 

@@ -178,7 +178,8 @@ def _save_landmark_image(img_t1, img_t2, img_t2_aligned,
     print(f"  [alignment] Landmark QC saved → {save_path}")
 
 
-
+def _fallback_translation(img_t1: np.ndarray, img_t2: np.ndarray,
+                           debug: bool = False):
     """Phase-correlation based translation-only alignment."""
     h1, w1 = img_t1.shape[:2]
     h2, w2 = img_t2.shape[:2]
