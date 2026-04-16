@@ -54,23 +54,81 @@ conda activate hypocotyl
 
 ## Usage
 
-### Basic run
-Place your image pair in `data/raw/`, then run from the **project root**:
+The pipeline has two modes selected by a required flag.
+
+### Single-pair mode (`--onePair`)
+
+Analyse one t1/t2 image pair:
 
 ```bash
-python pipeline/run_pipeline.py data/raw/IMG_t1.JPG data/raw/IMG_t2.JPG
+python pipeline/run_pipeline.py --onePair data/raw/IMG_t1.JPG data/raw/IMG_t2.JPG
 ```
 
-Results are saved automatically to `data/results/IMG_t1_vs_IMG_t2/`.
+Results are saved next to the images in a folder named `IMG_t1_vs_IMG_t2/`.
+
+### Batch mode (`--batch`)
+
+Analyse a full experiment in one go.  
+Expects this folder structure — one subfolder per box, each containing the two timepoint images:
+
+```
+my_experiment/
+├── box_01/
+│   ├── IMG_1720.JPG    ← t1 (lower number = earlier)
+│   └── IMG_1732.JPG    ← t2
+├── box_02/
+│   ├── IMG_1721.JPG
+│   └── IMG_1733.JPG
+└── ...
+```
+
+```bash
+python pipeline/run_pipeline.py --batch data/my_experiment/
+```
+
+The pipeline will work through each subfolder in order and ask before processing each one:
+
+```
+  [1/3]  Subfolder: box_01
+    t1 → IMG_1720.JPG
+    t2 → IMG_1732.JPG
+  Analyse this pair? [y/n]:
+```
+
+Press `y` to run the full pipeline for that pair, `n` (or Enter) to skip it.  
+All results from every analysed pair are combined into a single Excel file:
+
+```
+my_experiment/
+└── results/
+    ├── measurements_my_experiment.xlsx   ← all pairs in one file
+    └── qc/
+        ├── box_01/                       ← QC images per subfolder
+        └── box_02/
+```
+
+The Excel `image_t1` and `image_t2` columns identify which pair each row came from.
+
+#### Multi-timepoint subfolders (3+ images)
+
+If a subfolder contains more than 2 images (e.g. 4 timepoints), the pipeline processes **all N−1 consecutive pairs** automatically:
+
+| Step | Behaviour |
+|---|---|
+| Manual annotation (click cotyledon + root tip) | First image only |
+| Manual verification of positions | Last image only |
+| Intermediate timepoints | Positions carried forward automatically |
+| QC overlay saved | First pair and last pair only |
+
+All consecutive pairs are included in the combined Excel.
 
 ### Options
 
 | Flag | Description |
 |---|---|
-| `--out PATH` | Custom output directory |
-| `--debug-preprocess` | Check plate crop, ruler, and divider detection only — no segmentation |
+| `--out PATH` | Custom output directory (single-pair mode only) |
 | `--no-align` | Skip image alignment |
-| `--hypo-fraction 0.6` | Override hypocotyl/root split fraction at runtime |
+| `--debug` | Show extra debug plots |
 
 ### Tune the segmentation threshold
 
@@ -85,11 +143,27 @@ Pick the one where hypocotyls appear as clean white filaments, then set `PCV_THR
 
 ## Output files
 
+**Single-pair mode** — folder created next to the images:
 ```
-data/results/IMG_t1_vs_IMG_t2/
-├── measurements_IMG_t1_vs_IMG_t2.xlsx   ← main results
+IMG_t1_vs_IMG_t2/
+├── measurements_IMG_t1_vs_IMG_t2.xlsx
 └── qc/
-    └── qc_IMG_t1_vs_IMG_t2.png          ← visual QC overlay
+    ├── qc_IMG_t1_vs_IMG_t2.png
+    ├── aligned_t2_IMG_t2.png
+    └── alignment_landmarks_IMG_t1_vs_IMG_t2.png
+```
+
+**Batch mode** — single folder inside the experiment:
+```
+my_experiment/results/
+├── measurements_my_experiment.xlsx
+└── qc/
+    ├── box_01/
+    │   ├── qc_IMG_t1_vs_IMG_t2.png
+    │   ├── aligned_t2_IMG_t2.png
+    │   └── alignment_landmarks_IMG_t1_vs_IMG_t2.png
+    └── box_02/
+        └── ...
 ```
 
 ### Excel sheets

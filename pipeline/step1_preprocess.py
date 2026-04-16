@@ -136,31 +136,34 @@ def detect_px_per_mm(img: np.ndarray, plate_roi, debug: bool = False):
     """
     x, y, w, h = plate_roi
     img_h, img_w = img.shape[:2]
-    ruler_x     = x + w
-    ruler_strip = img[y: y + h, ruler_x: img_w]
-    rs_h, rs_w  = ruler_strip.shape[:2]
+    # Always extract the ruler from the rightmost RULER_STRIP_FRACTION of
+    # the image — not from the plate ROI edge, which may fall short of the
+    # actual ruler by hundreds of pixels (leaving background pixels in the
+    # strip that corrupt the signal statistics).
+    ruler_strip_w = int(img_w * config.RULER_STRIP_FRACTION)
+    ruler_x       = img_w - ruler_strip_w
+    ruler_strip   = img[y: y + h, ruler_x: img_w]
+    rs_h, rs_w    = ruler_strip.shape[:2]
 
-    # ── Color-based signal ───────────────────────────────────────────────
-    # Pink background: R >> G  →  (R - G) is large and positive
-    # White ticks:     R ≈ G   →  (R - G) is near zero
-    # Row minimum of (R-G): lowest value in each row.
-    # A white tick crossing that row pulls the minimum toward zero.
-    # Rows without ticks stay pink → high (R-G).
-    # Invert so tick rows become peaks.
-    r = ruler_strip[:, :, 0].astype(float)
-    g = ruler_strip[:, :, 1].astype(float)
-    redness = r - g                              # high=pink, low=white
+    # ── Signal: per-row minimum of (R-G), inverted ──────────────────────
+    # Pink background: R >> G  →  R-G large (≈ 40-130).
+    # White ticks:     R ≈ G   →  R-G small (≈ 0-20).
+    # Row minimum of R-G is pulled toward zero whenever ANY pixel in the
+    # row is whitish — even a narrow 1-mm tick that spans only ~20% of
+    # the strip width.  Inverting makes tick rows into peaks.
+    c0 = max(0,    int(rs_w * 0.10))
+    c1 = min(rs_w, int(rs_w * 0.90))
 
-    c0 = max(0,    int(rs_w * 0.05))
-    c1 = min(rs_w, int(rs_w * 0.95))
-
-    row_min_red = redness[:, c0:c1].min(axis=1)
-    signal      = gaussian_filter1d(row_min_red.max() - row_min_red, sigma=2.0)
+    r_strip    = ruler_strip[:, c0:c1, 0].astype(float)
+    g_strip    = ruler_strip[:, c0:c1, 1].astype(float)
+    redness    = r_strip - g_strip
+    row_min_rg = redness.min(axis=1)
+    signal     = gaussian_filter1d(row_min_rg.max() - row_min_rg, sigma=1.5)
 
     # ── Step 1: detect candidate peaks (permissive) ──────────────────────
     raw_peaks = np.array([], dtype=int)
     for prom_frac in (0.04, 0.02, 0.01):
-        raw_peaks, _ = find_peaks(signal, distance=10,
+        raw_peaks, _ = find_peaks(signal, distance=8,
                                    prominence=signal.max() * prom_frac)
         if len(raw_peaks) >= 4:
             break
@@ -173,14 +176,17 @@ def detect_px_per_mm(img: np.ndarray, plate_roi, debug: bool = False):
     n   = len(signal)
     tol = 4            # px — a detected peak must be within this of a grid line
 
-    # Search periods from 12 px up to n/3 (need at least 3 ticks visible)
+    # Search periods from 12 px up to n/4 (need at least 4 ticks visible).
+    # No arbitrary cap — let the data determine the period.
     d_min = 12
-    d_max = min(120, n // 3)
+    d_max = n // 4
 
-    best_count  = 0
+    best_score  = 0.0
     best_period = 30.0
     best_phase  = 0.0
+    best_count  = 0
 
+    n_peaks = len(raw_peaks)
     peaks_f = raw_peaks.astype(float)
 
     for d in range(d_min, d_max + 1):
@@ -191,10 +197,24 @@ def detect_px_per_mm(img: np.ndarray, plate_roi, debug: bool = False):
         counts = (diff <= tol).sum(axis=0)            # (d,)
         idx    = int(np.argmax(counts))
         cnt    = int(counts[idx])
-        if cnt > best_count:
-            best_count  = cnt
+        # Score = recall² × precision
+        #   recall    = min(cnt, n_grid) / n_grid
+        #               how many expected grid lines are actually filled
+        #               (capped at 1 — multiple peaks per line don't help)
+        #   precision = cnt / n_peaks
+        #               fraction of detected peaks that lie on the grid
+        # Squaring recall penalises periods where only a few grid lines
+        # are filled (e.g. very large d where only 3 of 4 lines match);
+        # precision penalises tiny periods that match many peaks by chance.
+        n_grid    = max(1, n // d)
+        recall    = min(cnt, n_grid) / n_grid
+        precision = cnt / n_peaks
+        score     = recall * recall * precision
+        if score > best_score:
+            best_score  = score
             best_period = float(d)
             best_phase  = float(idx)
+            best_count  = cnt
 
     # ── Step 3: evenly-spaced tick positions ─────────────────────────────
     ticks = np.arange(best_phase, n, best_period)
@@ -213,8 +233,7 @@ def detect_px_per_mm(img: np.ndarray, plate_roi, debug: bool = False):
     display_peaks = ticks[start: start + 12]
 
     print(f"  [ruler] {len(raw_peaks)} peaks detected  →  "
-          f"period={best_period:.0f} px, phase={best_phase:.0f}, "
-          f"explains {best_count}/{len(raw_peaks)} peaks  "
+          f"period={best_period:.0f} px, score={best_score:.2f}  "
           f"→  {px_per_mm:.2f} px/mm")
 
     if debug:

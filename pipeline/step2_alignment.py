@@ -1,7 +1,7 @@
 # ─────────────────────────────────────────────
 #  step2_alignment.py
 #  • Register t2 onto t1 coordinate space
-#  • Uses ORB feature matching + homography
+#  • Uses ORB + Lowe's ratio test + partial affine (4-DOF)
 #  • Falls back to phase correlation (translation only)
 # ─────────────────────────────────────────────
 
@@ -13,12 +13,16 @@ import matplotlib.pyplot as plt
 def align_images(img_t1: np.ndarray, img_t2: np.ndarray,
                  debug: bool = False, save_path: str = None):
     """
-    Align img_t2 to img_t1 using ORB keypoints + RANSAC homography.
+    Align img_t2 to img_t1 using ORB keypoints + partial affine transform.
+
+    Uses Lowe's ratio test (0.75) to filter matches before RANSAC, then fits
+    a 4-DOF similarity (translation + rotation + uniform scale).  This avoids
+    the stretching / perspective warp that a full homography can introduce
+    when features are unevenly distributed.
+
     Returns:
       img_t2_aligned : warped t2 image in t1 coordinate space
-      H              : 3x3 homography matrix (t2 → t1)
-
-    If save_path is given, always saves a landmark QC image there.
+      M              : 2×3 affine matrix (t2 → t1)
     """
     print("\n[Alignment] Computing registration t2 → t1")
 
@@ -37,10 +41,16 @@ def align_images(img_t1: np.ndarray, img_t2: np.ndarray,
                                  save_path, method="phase-correlation fallback")
         return result
 
-    bf   = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-    matches = sorted(bf.match(des1, des2), key=lambda m: m.distance)
-    good    = matches[: max(10, int(len(matches) * 0.4))]
-    print(f"  [alignment] {len(kp1)} / {len(kp2)} keypoints, {len(good)} good matches")
+    # ── Lowe's ratio test: keep only unambiguous matches ──────────────────
+    # kNN (k=2): for each descriptor find the two closest neighbours.
+    # A match is "good" only when the best distance is clearly smaller
+    # than the second-best (ratio < 0.75).  This removes many wrong pairs
+    # that a simple nearest-neighbour or cross-check would keep.
+    bf  = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+    raw = bf.knnMatch(des1, des2, k=2)
+    good = [m for m, n in raw if m.distance < 0.75 * n.distance]
+    print(f"  [alignment] {len(kp1)} / {len(kp2)} keypoints, "
+          f"{len(good)} good matches (Lowe's ratio test)")
 
     if len(good) < 8:
         print("  [alignment] Too few good matches – falling back to translation")
@@ -53,12 +63,18 @@ def align_images(img_t1: np.ndarray, img_t2: np.ndarray,
     pts1 = np.float32([kp1[m.queryIdx].pt for m in good])
     pts2 = np.float32([kp2[m.trainIdx].pt for m in good])
 
-    H, mask = cv2.findHomography(pts2, pts1, cv2.RANSAC, 5.0)
-    inliers  = int(mask.sum()) if mask is not None else 0
-    print(f"  [alignment] Homography inliers: {inliers}/{len(good)}")
+    # ── Partial affine (4-DOF): translation + rotation + uniform scale ────
+    # A full homography (8-DOF) can warp / stretch the image when features
+    # are clustered in one region.  estimateAffinePartial2D fits only the
+    # four degrees of freedom a hand-held re-photo actually introduces.
+    M, mask = cv2.estimateAffinePartial2D(pts2, pts1,
+                                          method=cv2.RANSAC,
+                                          ransacReprojThreshold=5.0)
+    inliers = int(mask.sum()) if mask is not None else 0
+    print(f"  [alignment] Partial-affine inliers: {inliers}/{len(good)}")
 
-    if H is None or inliers < 6:
-        print("  [alignment] Homography failed – falling back to translation")
+    if M is None or inliers < 6:
+        print("  [alignment] Affine fit failed – falling back to translation")
         result = _fallback_translation(img_t1, img_t2, debug)
         if save_path:
             _save_landmark_image(img_t1, img_t2, result[0], kp1, kp2, good, mask,
@@ -66,9 +82,9 @@ def align_images(img_t1: np.ndarray, img_t2: np.ndarray,
         return result
 
     h, w = img_t1.shape[:2]
-    img_t2_aligned = cv2.warpPerspective(
+    img_t2_aligned = cv2.warpAffine(
         cv2.cvtColor(img_t2, cv2.COLOR_RGB2BGR),
-        H, (w, h),
+        M, (w, h),
         flags=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=(0, 0, 0)
@@ -78,11 +94,11 @@ def align_images(img_t1: np.ndarray, img_t2: np.ndarray,
     if save_path:
         _save_landmark_image(img_t1, img_t2, img_t2_aligned,
                              kp1, kp2, good, mask, save_path,
-                             method=f"ORB homography ({inliers} inliers)")
+                             method=f"ORB partial-affine ({inliers} inliers)")
     if debug:
         _show_alignment_debug(img_t1, img_t2, img_t2_aligned, kp1, kp2, good, mask)
 
-    return img_t2_aligned, H
+    return img_t2_aligned, M
 
 
 def _save_landmark_image(img_t1, img_t2, img_t2_aligned,
@@ -269,5 +285,5 @@ if __name__ == "__main__":
     crop1 = img1[y1:y1+h1, x1:x1+w1]
     crop2 = img2[y2:y2+h2, x2:x2+w2]
 
-    aligned, H = align_images(crop1, crop2, debug=True)
-    print("H =\n", H)
+    aligned, M = align_images(crop1, crop2, debug=True)
+    print("M =\n", M)

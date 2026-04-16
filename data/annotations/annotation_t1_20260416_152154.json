@@ -1,0 +1,46 @@
+{
+  "image_path": "..\\Hipocotilos\\DCP5\\2026-01_dcp5_gating_28LL\\2026-01-28_gating_CT_20-24\\A_28\\IMG_1718.jpg",
+  "image_shape": [
+    2337,
+    2829,
+    3
+  ],
+  "timepoint": "t1",
+  "timestamp": "20260416_152154",
+  "n_seedlings": 3,
+  "annotations": [
+    {
+      "seedling_id": 1,
+      "cotyledon_top": [
+        1170,
+        67
+      ],
+      "root_tip": [
+        1270,
+        55
+      ]
+    },
+    {
+      "seedling_id": 2,
+      "cotyledon_top": [
+        1130,
+        294
+      ],
+      "root_tip": [
+        1199,
+        315
+      ]
+    },
+    {
+      "seedling_id": 3,
+      "cotyledon_top": [
+        1169,
+        507
+      ],
+      "root_tip": [
+        1242,
+        453
+      ]
+    }
+  ]
+}

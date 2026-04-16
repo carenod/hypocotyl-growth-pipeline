@@ -1,0 +1,134 @@
+{
+  "image_path": "..\\Hipocotilos\\DCP5\\2026-01_dcp5_gating_28LL\\2026-01-28_gating_CT_20-24\\A_28\\IMG_1718.jpg",
+  "image_shape": [
+    2337,
+    2829,
+    3
+  ],
+  "timepoint": "t1",
+  "timestamp": "20260416_150907",
+  "n_seedlings": 11,
+  "annotations": [
+    {
+      "seedling_id": 1,
+      "cotyledon_top": [
+        1164,
+        62
+      ],
+      "root_tip": [
+        1268,
+        57
+      ]
+    },
+    {
+      "seedling_id": 2,
+      "cotyledon_top": [
+        1165,
+        145
+      ],
+      "root_tip": [
+        1229,
+        132
+      ]
+    },
+    {
+      "seedling_id": 3,
+      "cotyledon_top": [
+        1129,
+        289
+      ],
+      "root_tip": [
+        1202,
+        316
+      ]
+    },
+    {
+      "seedling_id": 4,
+      "cotyledon_top": [
+        1188,
+        385
+      ],
+      "root_tip": [
+        1268,
+        367
+      ]
+    },
+    {
+      "seedling_id": 5,
+      "cotyledon_top": [
+        1168,
+        505
+      ],
+      "root_tip": [
+        1231,
+        457
+      ]
+    },
+    {
+      "seedling_id": 6,
+      "cotyledon_top": [
+        1119,
+        561
+      ],
+      "root_tip": [
+        1202,
+        564
+      ]
+    },
+    {
+      "seedling_id": 7,
+      "cotyledon_top": [
+        1189,
+        763
+      ],
+      "root_tip": [
+        1260,
+        788
+      ]
+    },
+    {
+      "seedling_id": 8,
+      "cotyledon_top": [
+        1091,
+        1140
+      ],
+      "root_tip": [
+        1161,
+        1136
+      ]
+    },
+    {
+      "seedling_id": 9,
+      "cotyledon_top": [
+        1148,
+        1547
+      ],
+      "root_tip": [
+        1213,
+        1601
+      ]
+    },
+    {
+      "seedling_id": 10,
+      "cotyledon_top": [
+        1093,
+        1638
+      ],
+      "root_tip": [
+        1140,
+        1686
+      ]
+    },
+    {
+      "seedling_id": 11,
+      "cotyledon_top": [
+        1108,
+        1866
+      ],
+      "root_tip": [
+        1185,
+        1880
+      ]
+    }
+  ]
+}
